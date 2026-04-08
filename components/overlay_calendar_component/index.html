@@ -1,0 +1,177 @@
+﻿<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    html, body { margin: 0; padding: 0; font-family: sans-serif; background: transparent; }
+    .head { display:grid; grid-template-columns:repeat(7, 1fr); border-top:1px solid #d7dce3; border-left:1px solid #d7dce3; }
+    .head-cell { border-right:1px solid #d7dce3; border-bottom:1px solid #d7dce3; background:#f5f7fa; padding:7px 8px; font-size:12px; font-weight:700; color:#334155; }
+    .head-cell.sun { color:#dc2626; }
+    .head-cell.sat { color:#2563eb; }
+    .week { position:relative; border-left:1px solid #d7dce3; border-right:1px solid #d7dce3; border-bottom:1px solid #d7dce3; background:#fff; background-image:repeating-linear-gradient(to right, transparent, transparent calc(14.2857% - 1px), #d7dce3 calc(14.2857% - 1px), #d7dce3 14.2857%); }
+    .grid { display:grid; grid-template-columns:repeat(7, 1fr); }
+    .day { min-height:140px; padding:4px 6px; background:transparent; }
+    .day.outside { background:#fafafa; color:#9ca3af; }
+    .day.today { background:#fff7cc; box-shadow: inset 0 0 0 2px #f0c74d; }
+    .daynum { font-size:12px; line-height:1; color:#334155; }
+    .daynum.sun { color:#dc2626; }
+    .daynum.sat { color:#2563eb; }
+    .bars { position:absolute; left:0; right:0; top:24px; }
+    .bar-wrap { position:absolute; }
+    .bar { width:100%; height:18px; border:none; padding:0 7px; color:#fff; font-size:10px; line-height:18px; text-align:left; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; cursor:pointer; }
+    .bar.domestic { background:#5bbad5; }
+    .bar.export { background:#d6453d; }
+    .bar.north_america { background:#ea580c; }
+    .bar.start { border-radius:999px 4px 4px 999px; }
+    .bar.middle { border-radius:0; }
+    .bar.end { border-radius:4px 999px 999px 4px; }
+    .bar.single { border-radius:999px; }
+    .bar.selected { box-shadow: inset 0 0 0 2px #1f2937; }
+    .more-btn {
+      position:absolute;
+      left:8px;
+      bottom:6px;
+      height:20px;
+      padding:0 8px;
+      border:1px solid #cbd5e1;
+      border-radius:999px;
+      background:#f8fafc;
+      color:#334155;
+      font-size:11px;
+      line-height:18px;
+      cursor:pointer;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const Streamlit = {
+      RENDER_EVENT: 'streamlit:render',
+      events: new EventTarget(),
+      lastFrameHeight: 0,
+      setComponentReady() {
+        window.addEventListener('message', (event) => {
+          const type = event.data && event.data.type;
+          if (type === Streamlit.RENDER_EVENT) {
+            const renderEvent = new CustomEvent(Streamlit.RENDER_EVENT, {
+              detail: {
+                args: event.data.args || {},
+                disabled: Boolean(event.data.disabled),
+                theme: event.data.theme || null,
+              },
+            });
+            Streamlit.events.dispatchEvent(renderEvent);
+          }
+        });
+        window.parent.postMessage({ isStreamlitMessage: true, type: 'streamlit:componentReady', apiVersion: 1 }, '*');
+      },
+      setFrameHeight(height) {
+        const nextHeight = height || document.body.scrollHeight;
+        if (nextHeight === Streamlit.lastFrameHeight) return;
+        Streamlit.lastFrameHeight = nextHeight;
+        window.parent.postMessage({ isStreamlitMessage: true, type: 'streamlit:setFrameHeight', height: nextHeight }, '*');
+      },
+      setComponentValue(value) {
+        window.parent.postMessage({ isStreamlitMessage: true, type: 'streamlit:setComponentValue', value, dataType: 'json' }, '*');
+      }
+    };
+
+    const root = document.getElementById('root');
+    let lastClicked = '';
+    let expandedWeeks = new Set();
+
+    function esc(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function render(event) {
+      const args = event.detail.args || {};
+      const data = args.data || { weekday_labels: [], weeks: [] };
+      const selected = args.selected_group_key || '';
+
+      let html = '<div class="head">';
+      (data.weekday_labels || []).forEach((label, idx) => {
+        const cls = idx === 0 ? 'sun' : idx === 6 ? 'sat' : '';
+        html += `<div class="head-cell ${cls}">${esc(label)}</div>`;
+      });
+      html += '</div>';
+
+      (data.weeks || []).forEach((week) => {
+        const laneCount = Math.max((week.lanes || []).length, 1);
+        const weekKey = String(week.week_key ?? '');
+        const isExpanded = expandedWeeks.has(weekKey);
+        const visibleLanes = isExpanded ? laneCount : Math.min(laneCount, 6);
+        const weekHeight = 34 + visibleLanes * 22 + 78;
+        html += `<div class="week" data-week-key="${esc(weekKey)}" style="height:${weekHeight}px;">`;
+        html += '<div class="grid">';
+        (week.days || []).forEach((day) => {
+          const dayClass = day.weekday_index === 0 ? 'sun' : day.weekday_index === 6 ? 'sat' : '';
+          const classes = ['day'];
+          if (!day.in_month) classes.push('outside');
+          if (day.is_today) classes.push('today');
+          html += `<div class="${classes.join(' ')}"><div class="daynum ${dayClass}">${esc(day.day)}</div></div>`;
+        });
+        html += '</div><div class="bars">';
+        (week.lanes || []).slice(0, visibleLanes).forEach((lane, laneIdx) => {
+          lane.forEach((item) => {
+            const leftPct = item.start_col * (100 / 7);
+            const widthPct = (item.end_col - item.start_col + 1) * (100 / 7);
+            const topPx = laneIdx * 22;
+            const selectedClass = item.group_key === selected ? 'selected' : '';
+            html += `
+              <div class="bar-wrap" style="left:calc(${leftPct}% + 2px); width:calc(${widthPct}% - 4px); top:${topPx}px;">
+                <button type="button" class="bar ${item.color_type} ${item.shape} ${selectedClass}" data-key="${esc(item.group_key)}" title="${esc(item.title)}">${esc(item.label)}</button>
+              </div>`;
+          });
+        });
+        html += '</div>';
+        if (laneCount > 6) {
+          const hiddenCount = laneCount - 6;
+          const moreLabel = isExpanded ? '접기' : ('+' + hiddenCount + '개 더보기');
+          html += `<button type="button" class="more-btn" data-week-key="${esc(weekKey)}">${esc(moreLabel)}</button>`;
+        }
+        html += '</div>';
+      });
+
+      root.innerHTML = html;
+      Streamlit.setFrameHeight(document.body.scrollHeight + 8);
+    }
+
+    root.addEventListener('click', (e) => {
+      const button = e.target.closest('.bar');
+      if (!button) {
+        const moreBtn = e.target.closest('.more-btn');
+        if (!moreBtn) return;
+        const weekKey = moreBtn.getAttribute('data-week-key') || '';
+        if (!weekKey) return;
+        if (expandedWeeks.has(weekKey)) expandedWeeks.delete(weekKey);
+        else expandedWeeks.add(weekKey);
+        const renderEvent = new CustomEvent(Streamlit.RENDER_EVENT, { detail: { args: window.__lastArgs || {} } });
+        Streamlit.events.dispatchEvent(renderEvent);
+        return;
+      }
+      e.preventDefault();
+      e.stopPropagation();
+      const key = button.getAttribute('data-key');
+      lastClicked = key || '';
+      root.querySelectorAll('.bar').forEach((el) => el.classList.remove('selected'));
+      button.classList.add('selected');
+      Streamlit.setComponentValue(key);
+      Streamlit.setFrameHeight(document.body.scrollHeight + 8);
+    });
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, render);
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, (event) => {
+      window.__lastArgs = event.detail.args || {};
+    });
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(600);
+  </script>
+</body>
+</html>

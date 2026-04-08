@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Streamlit/local secrets
+.streamlit/secrets.toml
+.env
+
+# Google credentials / keys
+streamlit-sheets-upload-*.json
+*service-account*.json
+*credentials*.json
+
+# Local raw data files
+*.xls
+*.xlsx
+*.csv
+
+# Logs and temp outputs
+*.log
+public_link.txt
+public_tunnel*.log
+
+# Local/editor folders
+.cursor/
+

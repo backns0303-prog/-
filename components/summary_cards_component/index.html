@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    html, body { margin: 0; padding: 0; background: transparent; font-family: sans-serif; }
+    .grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    @media (max-width: 1000px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+    .card {
+      width: 100%;
+      border: 1px solid #e2e8f0;
+      border-radius: 18px;
+      background: #ffffff;
+      padding: 16px 18px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.06);
+      text-align: left;
+      cursor: pointer;
+      transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease;
+    }
+    .card:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 4px 10px rgba(15, 23, 42, 0.12);
+      border-color: #cbd5e1;
+    }
+    .subtitle {
+      font-size: 18px;
+      color: #334155;
+      font-weight: 700;
+      margin-bottom: 10px;
+      line-height: 1.25;
+    }
+    .total {
+      font-size: 38px;
+      color: #0f172a;
+      font-weight: 800;
+      line-height: 1.1;
+    }
+    .partial {
+      margin-top: 8px;
+      font-size: 13px;
+      color: #64748b;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    const Streamlit = {
+      RENDER_EVENT: "streamlit:render",
+      events: new EventTarget(),
+      lastFrameHeight: 0,
+      setComponentReady() {
+        window.addEventListener("message", (event) => {
+          const type = event.data && event.data.type;
+          if (type === Streamlit.RENDER_EVENT) {
+            const renderEvent = new CustomEvent(Streamlit.RENDER_EVENT, {
+              detail: { args: event.data.args || {} },
+            });
+            Streamlit.events.dispatchEvent(renderEvent);
+          }
+        });
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:componentReady", apiVersion: 1 }, "*");
+      },
+      setFrameHeight(height) {
+        const nextHeight = height || document.body.scrollHeight;
+        if (nextHeight === Streamlit.lastFrameHeight) return;
+        Streamlit.lastFrameHeight = nextHeight;
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setFrameHeight", height: nextHeight }, "*");
+      },
+      setComponentValue(value) {
+        window.parent.postMessage({ isStreamlitMessage: true, type: "streamlit:setComponentValue", value, dataType: "json" }, "*");
+      },
+    };
+
+    const root = document.getElementById("root");
+
+    function esc(v) {
+      return String(v ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;");
+    }
+
+    function render(event) {
+      const data = (event.detail.args && event.detail.args.data) || {};
+      const cards = Array.isArray(data.cards) ? data.cards : [];
+      const html = cards.map((card) => `
+        <button class="card" data-key="${esc(card.key)}" type="button">
+          <div class="subtitle">${esc(card.subtitle)}</div>
+          <div class="total">${esc(card.total)}</div>
+          <div class="partial">${esc(card.partial)}</div>
+        </button>
+      `).join("");
+
+      root.innerHTML = `<div class="grid">${html}</div>`;
+      Streamlit.setFrameHeight(document.body.scrollHeight + 8);
+    }
+
+    root.addEventListener("click", (e) => {
+      const card = e.target.closest(".card");
+      if (!card) return;
+      const key = card.getAttribute("data-key");
+      Streamlit.setComponentValue(key);
+    });
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, render);
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(220);
+  </script>
+</body>
+</html>

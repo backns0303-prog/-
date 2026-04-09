@@ -1,6 +1,7 @@
 import calendar
 import io
 import json
+from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path
 import re
@@ -611,23 +612,76 @@ def to_numeric(series: pd.Series) -> pd.Series:
 def open_spreadsheet():
     creds = None
 
+    def _to_plain_dict(value):
+        if isinstance(value, Mapping):
+            return {k: _to_plain_dict(v) for k, v in value.items()}
+        return value
+
+    def _normalize_service_account_info(info: dict) -> dict:
+        normalized = dict(info)
+        private_key = str(normalized.get("private_key", ""))
+        # secrets에 \n 문자열로 저장된 경우 실제 줄바꿈으로 복원
+        if "\\n" in private_key:
+            normalized["private_key"] = private_key.replace("\\n", "\n")
+        return normalized
+
     # 1) Streamlit Cloud secrets 우선
+    parse_errors: list[str] = []
     try:
-        if "gcp_service_account" in st.secrets:
-            info = dict(st.secrets["gcp_service_account"])
-            creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
-        elif "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
-            info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
-            creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+        try:
+            top_secrets = st.secrets.to_dict()
+        except Exception:
+            top_secrets = {k: st.secrets[k] for k in st.secrets.keys()}
+
+        # A. 중첩 객체 방식: [gcp_service_account] ... (권장)
+        for key in ["gcp_service_account", "GCP_SERVICE_ACCOUNT", "google_service_account", "service_account"]:
+            raw = top_secrets.get(key)
+            if not raw:
+                continue
+            try:
+                if isinstance(raw, str):
+                    info = json.loads(raw)
+                else:
+                    info = _to_plain_dict(raw)
+                info = _normalize_service_account_info(info)
+                creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+                break
+            except Exception as exc:
+                parse_errors.append(f"{key}: {exc}")
+
+        # B. 평면 키 방식(type/project_id/private_key...)
+        if creds is None:
+            required = ["type", "project_id", "private_key", "client_email", "token_uri"]
+            if all(k in top_secrets for k in required):
+                try:
+                    info = {k: top_secrets.get(k) for k in required + [
+                        "private_key_id", "client_id", "auth_uri",
+                        "auth_provider_x509_cert_url", "client_x509_cert_url", "universe_domain"
+                    ]}
+                    info = _normalize_service_account_info(info)
+                    creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+                except Exception as exc:
+                    parse_errors.append(f"flat_keys: {exc}")
+
+        # C. JSON 문자열 방식
+        if creds is None and "GCP_SERVICE_ACCOUNT_JSON" in top_secrets:
+            try:
+                info = json.loads(str(top_secrets["GCP_SERVICE_ACCOUNT_JSON"]))
+                info = _normalize_service_account_info(info)
+                creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+            except Exception as exc:
+                parse_errors.append(f"GCP_SERVICE_ACCOUNT_JSON: {exc}")
     except Exception as exc:
-        raise RuntimeError(f"Streamlit secrets 구글 인증정보를 읽지 못했습니다: {exc}") from exc
+        parse_errors.append(f"secrets_read: {exc}")
 
     # 2) 로컬 파일 fallback
     if creds is None:
         if not GOOGLE_CREDENTIALS_FILE.exists():
+            parse_msg = (" / ".join(parse_errors)) if parse_errors else "no-credentials"
             raise FileNotFoundError(
                 f"구글 인증정보가 없습니다. Streamlit secrets(gcp_service_account) 또는 "
                 f"{GOOGLE_CREDENTIALS_FILE.name} 파일을 설정하세요."
+                f" (secrets parse: {parse_msg})"
             )
         creds = Credentials.from_service_account_file(str(GOOGLE_CREDENTIALS_FILE), scopes=GOOGLE_SCOPES)
 

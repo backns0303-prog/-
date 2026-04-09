@@ -1,6 +1,7 @@
 import calendar
 import io
 import json
+import os
 from collections.abc import Mapping
 from datetime import date, timedelta
 from pathlib import Path
@@ -664,24 +665,43 @@ def open_spreadsheet():
                     parse_errors.append(f"flat_keys: {exc}")
 
         # C. JSON 문자열 방식
-        if creds is None and "GCP_SERVICE_ACCOUNT_JSON" in top_secrets:
-            try:
-                info = json.loads(str(top_secrets["GCP_SERVICE_ACCOUNT_JSON"]))
-                info = _normalize_service_account_info(info)
-                creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
-            except Exception as exc:
-                parse_errors.append(f"GCP_SERVICE_ACCOUNT_JSON: {exc}")
+        if creds is None:
+            for json_key in ["GCP_SERVICE_ACCOUNT_JSON", "gcp_service_account_json", "GOOGLE_SERVICE_ACCOUNT_JSON"]:
+                if json_key not in top_secrets:
+                    continue
+                try:
+                    info = json.loads(str(top_secrets[json_key]))
+                    info = _normalize_service_account_info(info)
+                    creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+                    break
+                except Exception as exc:
+                    parse_errors.append(f"{json_key}: {exc}")
     except Exception as exc:
         parse_errors.append(f"secrets_read: {exc}")
+
+    # 1-2) 환경변수 fallback (Streamlit Cloud Advanced settings에서 설정 가능)
+    if creds is None:
+        for env_key in ["GCP_SERVICE_ACCOUNT_JSON", "GOOGLE_SERVICE_ACCOUNT_JSON"]:
+            raw_env = os.getenv(env_key, "").strip()
+            if not raw_env:
+                continue
+            try:
+                info = json.loads(raw_env)
+                info = _normalize_service_account_info(info)
+                creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+                break
+            except Exception as exc:
+                parse_errors.append(f"env:{env_key}: {exc}")
 
     # 2) 로컬 파일 fallback
     if creds is None:
         if not GOOGLE_CREDENTIALS_FILE.exists():
             parse_msg = (" / ".join(parse_errors)) if parse_errors else "no-credentials"
             raise FileNotFoundError(
-                f"구글 인증정보가 없습니다. Streamlit secrets(gcp_service_account) 또는 "
-                f"{GOOGLE_CREDENTIALS_FILE.name} 파일을 설정하세요."
-                f" (secrets parse: {parse_msg})"
+                "구글 인증정보를 찾지 못했습니다. "
+                "Streamlit Cloud의 Secrets에 [gcp_service_account] 블록을 넣거나 "
+                "GCP_SERVICE_ACCOUNT_JSON 문자열을 설정해 주세요. "
+                f"(parse detail: {parse_msg})"
             )
         creds = Credentials.from_service_account_file(str(GOOGLE_CREDENTIALS_FILE), scopes=GOOGLE_SCOPES)
 

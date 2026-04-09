@@ -1331,6 +1331,10 @@ def initialize_state():
         st.session_state["detail_order_ids"] = []
     if "drilldown_order_id" not in st.session_state:
         st.session_state["drilldown_order_id"] = None
+    if "last_summary_click_ts" not in st.session_state:
+        st.session_state["last_summary_click_ts"] = 0
+    if "last_calendar_click_ts" not in st.session_state:
+        st.session_state["last_calendar_click_ts"] = 0
 
 
 def get_filtered_orders(data: dict):
@@ -1556,6 +1560,7 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                     selected_keys_from_component = [clicked_order_id]
 
             changed = False
+            calendar_interacted = clicked_result is not None
             if selected_keys_from_component is not None:
                 if selected_keys_from_component != st.session_state.get("selected_order_ids", []):
                     st.session_state["selected_order_ids"] = selected_keys_from_component
@@ -1565,6 +1570,16 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 st.session_state["detail_selected_order_id"] = clicked_order_id
                 if clicked_order_id not in st.session_state.get("selected_order_ids", []):
                     st.session_state["selected_order_ids"] = [clicked_order_id]
+                changed = True
+            if calendar_interacted and (
+                st.session_state.get("detail_metric") is not None
+                or st.session_state.get("drilldown_order_id") is not None
+                or bool(st.session_state.get("detail_order_ids"))
+            ):
+                # 캘린더 클릭 시 요약/드릴다운 팝업 상태는 닫는다.
+                st.session_state["detail_metric"] = None
+                st.session_state["detail_order_ids"] = []
+                st.session_state["drilldown_order_id"] = None
                 changed = True
             if changed:
                 st.rerun()
@@ -2034,7 +2049,6 @@ def main():
     render_metrics(filtered_orders)
     render_dialogs(filtered_orders, data)
     render_calendar_and_detail(filtered_orders, data, available_months)
-    render_order_list(filtered_orders)
 
 
 def render_order_list(filtered_orders: list[dict]):
@@ -2135,13 +2149,37 @@ def render_metrics(filtered_orders: list[dict]):
         key="summary_cards_click",
         default=None,
     )
-    if clicked_summary == "weekly":
+    clicked_key = None
+    clicked_ts = None
+    if isinstance(clicked_summary, dict):
+        clicked_key = clicked_summary.get("key")
+        clicked_ts = clicked_summary.get("ts")
+    elif isinstance(clicked_summary, str):
+        clicked_key = clicked_summary
+
+    is_new_summary_click = False
+    if clicked_ts is not None:
+        try:
+            clicked_ts_int = int(clicked_ts)
+        except Exception:
+            clicked_ts_int = 0
+        if clicked_ts_int and clicked_ts_int != int(st.session_state.get("last_summary_click_ts", 0)):
+            st.session_state["last_summary_click_ts"] = clicked_ts_int
+            is_new_summary_click = True
+    elif clicked_key:
+        # 문자열 fallback(구버전 캐시)에서는 즉시 1회 처리
+        is_new_summary_click = True
+
+    if not is_new_summary_click:
+        return
+
+    if clicked_key == "weekly":
         st.session_state["detail_metric"] = "totalOrders"
         st.session_state["detail_order_ids"] = st.session_state.get("weekly_order_ids", [])
-    elif clicked_summary == "monthly":
+    elif clicked_key == "monthly":
         st.session_state["detail_metric"] = "groupedCount"
         st.session_state["detail_order_ids"] = st.session_state.get("monthly_order_ids", [])
-    elif clicked_summary == "na_biweekly":
+    elif clicked_key == "na_biweekly":
         st.session_state["detail_metric"] = "totalOrders"
         st.session_state["detail_order_ids"] = st.session_state.get("na_biweekly_order_ids", [])
 
@@ -2305,6 +2343,7 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             )
             clicked_order_id = None
             selected_keys_from_component = None
+            clicked_ts_int = 0
             if isinstance(clicked_result, dict):
                 clicked_order_id = clicked_result.get("lastClicked")
                 raw_keys = clicked_result.get("selectedKeys")
@@ -2312,21 +2351,39 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                     selected_keys_from_component = [
                         str(order_id) for order_id in raw_keys if str(order_id) in valid_ids
                     ]
+                try:
+                    clicked_ts_int = int(clicked_result.get("ts") or 0)
+                except Exception:
+                    clicked_ts_int = 0
             elif isinstance(clicked_result, str):
                 clicked_order_id = clicked_result
                 if clicked_order_id in valid_ids:
                     selected_keys_from_component = [clicked_order_id]
 
+            last_calendar_ts = int(st.session_state.get("last_calendar_click_ts", 0))
+            is_new_calendar_click = clicked_ts_int > 0 and clicked_ts_int != last_calendar_ts
+            if is_new_calendar_click:
+                st.session_state["last_calendar_click_ts"] = clicked_ts_int
+
             changed = False
-            if selected_keys_from_component is not None:
+            if is_new_calendar_click and selected_keys_from_component is not None:
                 if selected_keys_from_component != st.session_state.get("selected_order_ids", []):
                     st.session_state["selected_order_ids"] = selected_keys_from_component
                     changed = True
-            if clicked_order_id and clicked_order_id in valid_ids and clicked_order_id != st.session_state["selected_order_id"]:
+            if is_new_calendar_click and clicked_order_id and clicked_order_id in valid_ids and clicked_order_id != st.session_state["selected_order_id"]:
                 st.session_state["selected_order_id"] = clicked_order_id
                 st.session_state["detail_selected_order_id"] = clicked_order_id
                 if clicked_order_id not in st.session_state.get("selected_order_ids", []):
                     st.session_state["selected_order_ids"] = [clicked_order_id]
+                changed = True
+            if is_new_calendar_click and (
+                st.session_state.get("detail_metric") is not None
+                or st.session_state.get("drilldown_order_id") is not None
+                or bool(st.session_state.get("detail_order_ids"))
+            ):
+                st.session_state["detail_metric"] = None
+                st.session_state["detail_order_ids"] = []
+                st.session_state["drilldown_order_id"] = None
                 changed = True
             if changed:
                 st.rerun()

@@ -1,5 +1,6 @@
 import calendar
 import io
+import json
 from datetime import date, timedelta
 from pathlib import Path
 import re
@@ -608,9 +609,28 @@ def to_numeric(series: pd.Series) -> pd.Series:
 
 
 def open_spreadsheet():
-    if not GOOGLE_CREDENTIALS_FILE.exists():
-        raise FileNotFoundError(f"구글 인증 파일이 없습니다: {GOOGLE_CREDENTIALS_FILE.name}")
-    creds = Credentials.from_service_account_file(str(GOOGLE_CREDENTIALS_FILE), scopes=GOOGLE_SCOPES)
+    creds = None
+
+    # 1) Streamlit Cloud secrets 우선
+    try:
+        if "gcp_service_account" in st.secrets:
+            info = dict(st.secrets["gcp_service_account"])
+            creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+        elif "GCP_SERVICE_ACCOUNT_JSON" in st.secrets:
+            info = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+            creds = Credentials.from_service_account_info(info, scopes=GOOGLE_SCOPES)
+    except Exception as exc:
+        raise RuntimeError(f"Streamlit secrets 구글 인증정보를 읽지 못했습니다: {exc}") from exc
+
+    # 2) 로컬 파일 fallback
+    if creds is None:
+        if not GOOGLE_CREDENTIALS_FILE.exists():
+            raise FileNotFoundError(
+                f"구글 인증정보가 없습니다. Streamlit secrets(gcp_service_account) 또는 "
+                f"{GOOGLE_CREDENTIALS_FILE.name} 파일을 설정하세요."
+            )
+        creds = Credentials.from_service_account_file(str(GOOGLE_CREDENTIALS_FILE), scopes=GOOGLE_SCOPES)
+
     client = gspread.authorize(creds)
     return client.open_by_key(GOOGLE_SPREADSHEET_ID)
 

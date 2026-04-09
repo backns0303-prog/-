@@ -79,8 +79,8 @@
     };
 
     const root = document.getElementById('root');
-    let lastClicked = '';
     let expandedWeeks = new Set();
+    let currentSelectedKeys = new Set();
 
     function esc(value) {
       return String(value ?? '')
@@ -94,6 +94,16 @@
       const args = event.detail.args || {};
       const data = args.data || { weekday_labels: [], weeks: [] };
       const selected = args.selected_group_key || '';
+      const selectedKeysArg = Array.isArray(args.selected_group_keys)
+        ? args.selected_group_keys.filter(Boolean).map(String)
+        : [];
+      if (selectedKeysArg.length > 0) {
+        currentSelectedKeys = new Set(selectedKeysArg);
+      } else if (selected) {
+        currentSelectedKeys = new Set([String(selected)]);
+      } else {
+        currentSelectedKeys = new Set();
+      }
 
       let html = '<div class="head">';
       (data.weekday_labels || []).forEach((label, idx) => {
@@ -123,7 +133,7 @@
             const leftPct = item.start_col * (100 / 7);
             const widthPct = (item.end_col - item.start_col + 1) * (100 / 7);
             const topPx = laneIdx * 22;
-            const selectedClass = item.group_key === selected ? 'selected' : '';
+            const selectedClass = currentSelectedKeys.has(String(item.group_key)) ? 'selected' : '';
             html += `
               <div class="bar-wrap" style="left:calc(${leftPct}% + 2px); width:calc(${widthPct}% - 4px); top:${topPx}px;">
                 <button type="button" class="bar ${item.color_type} ${item.shape} ${selectedClass}" data-key="${esc(item.group_key)}" title="${esc(item.title)}">${esc(item.label)}</button>
@@ -158,11 +168,29 @@
       }
       e.preventDefault();
       e.stopPropagation();
-      const key = button.getAttribute('data-key');
-      lastClicked = key || '';
-      root.querySelectorAll('.bar').forEach((el) => el.classList.remove('selected'));
-      button.classList.add('selected');
-      Streamlit.setComponentValue(key);
+      const key = String(button.getAttribute('data-key') || '');
+      if (!key) return;
+      const isMulti = Boolean(e.ctrlKey || e.metaKey);
+
+      if (isMulti) {
+        if (currentSelectedKeys.has(key)) currentSelectedKeys.delete(key);
+        else currentSelectedKeys.add(key);
+      } else {
+        currentSelectedKeys = new Set([key]);
+      }
+
+      root.querySelectorAll('.bar').forEach((el) => {
+        const barKey = String(el.getAttribute('data-key') || '');
+        if (currentSelectedKeys.has(barKey)) el.classList.add('selected');
+        else el.classList.remove('selected');
+      });
+
+      Streamlit.setComponentValue({
+        lastClicked: key,
+        selectedKeys: Array.from(currentSelectedKeys),
+        multi: isMulti,
+        ts: Date.now(),
+      });
       Streamlit.setFrameHeight(document.body.scrollHeight + 8);
     });
 

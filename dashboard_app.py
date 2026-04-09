@@ -1,4 +1,5 @@
 import calendar
+import io
 from datetime import date, timedelta
 from pathlib import Path
 import re
@@ -7,6 +8,7 @@ import gspread
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
 
@@ -254,7 +256,8 @@ def inject_css():
         .block-container {
             padding-top: 1.6rem;
             padding-bottom: 2rem;
-            max-width: 1600px;
+            max-width: 98vw;
+            width: 98vw;
         }
         div[data-testid="stMetric"] {
             background: white;
@@ -493,6 +496,46 @@ def shorten_item_name_for_display(value: str) -> str:
         if code and short_change:
             return f"{code}-{short_change}"
     return text
+
+
+def dataframe_to_styled_excel_bytes(df: pd.DataFrame, sheet_name: str = "통합품목") -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+        ws = writer.book[sheet_name]
+
+        body_font = Font(name="Malgun Gothic", size=11, bold=False)
+        head_font = Font(name="Malgun Gothic", size=12, bold=True)
+        center = Alignment(horizontal="center", vertical="center")
+        header_fill = PatternFill(fill_type="solid", fgColor="EDEDED")
+        thin_side = Side(style="thin", color="000000")
+        border = Border(left=thin_side, right=thin_side, top=thin_side, bottom=thin_side)
+
+        max_row = ws.max_row
+        max_col = ws.max_column
+        for row in range(1, max_row + 1):
+            for col in range(1, max_col + 1):
+                cell = ws.cell(row=row, column=col)
+                cell.alignment = center
+                cell.border = border
+                if row == 1:
+                    cell.font = head_font
+                    cell.fill = header_fill
+                else:
+                    cell.font = body_font
+                    cell.fill = PatternFill(fill_type=None)
+
+        for col_idx in range(1, max_col + 1):
+            col_letter = ws.cell(row=1, column=col_idx).column_letter
+            max_length = 0
+            for row_idx in range(1, max_row + 1):
+                value = ws.cell(row=row_idx, column=col_idx).value
+                if value is None:
+                    continue
+                max_length = max(max_length, len(str(value)))
+            ws.column_dimensions[col_letter].width = min(max(12, max_length + 2), 48)
+
+    return output.getvalue()
 
 
 def build_display_name(title, fallback: str = "") -> str:
@@ -1184,6 +1227,8 @@ def initialize_state():
         st.session_state["selected_month"] = "2026-03"
     if "selected_order_id" not in st.session_state:
         st.session_state["selected_order_id"] = "ORD-001"
+    if "selected_order_ids" not in st.session_state:
+        st.session_state["selected_order_ids"] = ["ORD-001"]
     if "detail_selected_order_id" not in st.session_state:
         st.session_state["detail_selected_order_id"] = "ORD-001"
     if "detail_metric" not in st.session_state:
@@ -1367,15 +1412,26 @@ def metric_rows(filtered_orders: list[dict]):
 
 
 def render_calendar_and_detail(filtered_orders: list[dict], data: dict, available_months: list[str]):
-    selected_id = st.session_state["selected_order_id"]
-    selected_order = next((order for order in filtered_orders if order["id"] == selected_id), None)
-    if not selected_order and filtered_orders:
-        selected_order = filtered_orders[0]
-        st.session_state["selected_order_id"] = selected_order["id"]
-    if st.session_state.get("detail_selected_order_id") != st.session_state["selected_order_id"]:
-        st.session_state["detail_selected_order_id"] = st.session_state["selected_order_id"]
+    order_by_id = {order["id"]: order for order in filtered_orders}
+    valid_ids = set(order_by_id.keys())
+    selected_ids = st.session_state.get("selected_order_ids", [])
+    if not isinstance(selected_ids, list):
+        selected_ids = []
+    selected_ids = [order_id for order_id in selected_ids if order_id in valid_ids]
 
-    left_col, right_col = st.columns([1.35, 1])
+    selected_id = st.session_state.get("selected_order_id", "")
+    if selected_id in valid_ids and selected_id not in selected_ids:
+        selected_ids = [selected_id]
+    if not selected_ids and filtered_orders:
+        selected_ids = [filtered_orders[0]["id"]]
+
+    st.session_state["selected_order_ids"] = selected_ids
+    if selected_ids and st.session_state.get("selected_order_id") not in selected_ids:
+        st.session_state["selected_order_id"] = selected_ids[0]
+    if st.session_state.get("detail_selected_order_id") != st.session_state.get("selected_order_id"):
+        st.session_state["detail_selected_order_id"] = st.session_state.get("selected_order_id")
+
+    left_col, right_col = st.columns([1, 1])
     with left_col:
         with st.container(border=True):
             filter_col1, filter_col2 = st.columns([1.35, 1])
@@ -1384,15 +1440,39 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             with filter_col2:
                 st.selectbox("조회 월", available_months, format_func=month_label, key="selected_month", on_change=on_top_filter_change)
             payload = build_overlay_calendar_payload(filtered_orders, st.session_state["selected_month"], st.session_state["view_style"])
-            clicked_order_id = overlay_calendar_component(
+            clicked_result = overlay_calendar_component(
                 data=payload,
                 selected_group_key=st.session_state["selected_order_id"],
+                selected_group_keys=st.session_state.get("selected_order_ids", []),
                 key="overlay_calendar",
                 default=None,
             )
-            if clicked_order_id and clicked_order_id != st.session_state["selected_order_id"]:
+            clicked_order_id = None
+            selected_keys_from_component = None
+            if isinstance(clicked_result, dict):
+                clicked_order_id = clicked_result.get("lastClicked")
+                raw_keys = clicked_result.get("selectedKeys")
+                if isinstance(raw_keys, list):
+                    selected_keys_from_component = [
+                        str(order_id) for order_id in raw_keys if str(order_id) in valid_ids
+                    ]
+            elif isinstance(clicked_result, str):
+                clicked_order_id = clicked_result
+                if clicked_order_id in valid_ids:
+                    selected_keys_from_component = [clicked_order_id]
+
+            changed = False
+            if selected_keys_from_component is not None:
+                if selected_keys_from_component != st.session_state.get("selected_order_ids", []):
+                    st.session_state["selected_order_ids"] = selected_keys_from_component
+                    changed = True
+            if clicked_order_id and clicked_order_id in valid_ids and clicked_order_id != st.session_state["selected_order_id"]:
                 st.session_state["selected_order_id"] = clicked_order_id
                 st.session_state["detail_selected_order_id"] = clicked_order_id
+                if clicked_order_id not in st.session_state.get("selected_order_ids", []):
+                    st.session_state["selected_order_ids"] = [clicked_order_id]
+                changed = True
+            if changed:
                 st.rerun()
 
     with right_col:
@@ -1571,15 +1651,26 @@ def render_dialogs(filtered_orders: list[dict], data: dict):
 
 
 def render_calendar_and_detail(filtered_orders: list[dict], data: dict, available_months: list[str]):
-    selected_id = st.session_state["selected_order_id"]
-    selected_order = next((order for order in filtered_orders if order["id"] == selected_id), None)
-    if not selected_order and filtered_orders:
-        selected_order = filtered_orders[0]
-        st.session_state["selected_order_id"] = selected_order["id"]
-    if st.session_state.get("detail_selected_order_id") != st.session_state["selected_order_id"]:
-        st.session_state["detail_selected_order_id"] = st.session_state["selected_order_id"]
+    order_by_id = {order["id"]: order for order in filtered_orders}
+    valid_ids = set(order_by_id.keys())
+    selected_ids = st.session_state.get("selected_order_ids", [])
+    if not isinstance(selected_ids, list):
+        selected_ids = []
+    selected_ids = [order_id for order_id in selected_ids if order_id in valid_ids]
 
-    left_col, right_col = st.columns([1.35, 1])
+    selected_id = st.session_state.get("selected_order_id", "")
+    if selected_id in valid_ids and selected_id not in selected_ids:
+        selected_ids = [selected_id]
+    if not selected_ids and filtered_orders:
+        selected_ids = [filtered_orders[0]["id"]]
+
+    st.session_state["selected_order_ids"] = selected_ids
+    if selected_ids and st.session_state.get("selected_order_id") not in selected_ids:
+        st.session_state["selected_order_id"] = selected_ids[0]
+    if st.session_state.get("detail_selected_order_id") != st.session_state.get("selected_order_id"):
+        st.session_state["detail_selected_order_id"] = st.session_state.get("selected_order_id")
+
+    left_col, right_col = st.columns([1, 1])
     with left_col:
         with st.container(border=True):
             filter_col1, filter_col2 = st.columns([1.35, 1])
@@ -1826,6 +1917,16 @@ def main():
         st.session_state["selected_month"] = current_month if current_month in available_months else available_months[-1]
     if st.session_state["selected_order_id"] not in {order["id"] for order in data["orders"]}:
         st.session_state["selected_order_id"] = data["orders"][0]["id"] if data["orders"] else ""
+    valid_ids = {order["id"] for order in data["orders"]}
+    selected_order_ids = st.session_state.get("selected_order_ids", [])
+    if not isinstance(selected_order_ids, list):
+        selected_order_ids = []
+    selected_order_ids = [order_id for order_id in selected_order_ids if order_id in valid_ids]
+    if st.session_state["selected_order_id"] and st.session_state["selected_order_id"] not in selected_order_ids:
+        selected_order_ids = [st.session_state["selected_order_id"]]
+    if not selected_order_ids and data["orders"]:
+        selected_order_ids = [data["orders"][0]["id"]]
+    st.session_state["selected_order_ids"] = selected_order_ids
     if st.session_state["detail_selected_order_id"] not in {order["id"] for order in data["orders"]}:
         st.session_state["detail_selected_order_id"] = st.session_state["selected_order_id"]
 
@@ -2057,15 +2158,26 @@ def build_overlay_calendar_payload(filtered_orders: list[dict], selected_month: 
 
 
 def render_calendar_and_detail(filtered_orders: list[dict], data: dict, available_months: list[str]):
-    selected_id = st.session_state["selected_order_id"]
-    selected_order = next((order for order in filtered_orders if order["id"] == selected_id), None)
-    if not selected_order and filtered_orders:
-        selected_order = filtered_orders[0]
-        st.session_state["selected_order_id"] = selected_order["id"]
-    if st.session_state.get("detail_selected_order_id") != st.session_state["selected_order_id"]:
-        st.session_state["detail_selected_order_id"] = st.session_state["selected_order_id"]
+    order_by_id = {order["id"]: order for order in filtered_orders}
+    valid_ids = set(order_by_id.keys())
+    selected_ids = st.session_state.get("selected_order_ids", [])
+    if not isinstance(selected_ids, list):
+        selected_ids = []
+    selected_ids = [order_id for order_id in selected_ids if order_id in valid_ids]
 
-    left_col, right_col = st.columns([1.35, 1])
+    selected_id = st.session_state.get("selected_order_id", "")
+    if selected_id in valid_ids and selected_id not in selected_ids:
+        selected_ids = [selected_id]
+    if not selected_ids and filtered_orders:
+        selected_ids = [filtered_orders[0]["id"]]
+
+    st.session_state["selected_order_ids"] = selected_ids
+    if selected_ids and st.session_state.get("selected_order_id") not in selected_ids:
+        st.session_state["selected_order_id"] = selected_ids[0]
+    if st.session_state.get("detail_selected_order_id") != st.session_state.get("selected_order_id"):
+        st.session_state["detail_selected_order_id"] = st.session_state.get("selected_order_id")
+
+    left_col, right_col = st.columns([1, 1])
     with left_col:
         with st.container(border=True):
             filter_col1, filter_col2 = st.columns([1.35, 1])
@@ -2090,15 +2202,39 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 st.session_state["selected_month"],
                 st.session_state["view_style"],
             )
-            clicked_order_id = overlay_calendar_component(
+            clicked_result = overlay_calendar_component(
                 data=payload,
                 selected_group_key=st.session_state["selected_order_id"],
+                selected_group_keys=st.session_state.get("selected_order_ids", []),
                 key="overlay_calendar",
                 default=None,
             )
-            if clicked_order_id and clicked_order_id != st.session_state["selected_order_id"]:
+            clicked_order_id = None
+            selected_keys_from_component = None
+            if isinstance(clicked_result, dict):
+                clicked_order_id = clicked_result.get("lastClicked")
+                raw_keys = clicked_result.get("selectedKeys")
+                if isinstance(raw_keys, list):
+                    selected_keys_from_component = [
+                        str(order_id) for order_id in raw_keys if str(order_id) in valid_ids
+                    ]
+            elif isinstance(clicked_result, str):
+                clicked_order_id = clicked_result
+                if clicked_order_id in valid_ids:
+                    selected_keys_from_component = [clicked_order_id]
+
+            changed = False
+            if selected_keys_from_component is not None:
+                if selected_keys_from_component != st.session_state.get("selected_order_ids", []):
+                    st.session_state["selected_order_ids"] = selected_keys_from_component
+                    changed = True
+            if clicked_order_id and clicked_order_id in valid_ids and clicked_order_id != st.session_state["selected_order_id"]:
                 st.session_state["selected_order_id"] = clicked_order_id
                 st.session_state["detail_selected_order_id"] = clicked_order_id
+                if clicked_order_id not in st.session_state.get("selected_order_ids", []):
+                    st.session_state["selected_order_ids"] = [clicked_order_id]
+                changed = True
+            if changed:
                 st.rerun()
 
     with right_col:
@@ -2108,7 +2244,15 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 st.info("선택 가능한 수주건이 없습니다.")
                 return
 
-            st.markdown(f"### {selected_order['displayName']}")
+            selected_orders = [
+                order_by_id[order_id]
+                for order_id in st.session_state.get("selected_order_ids", [])
+                if order_id in order_by_id
+            ]
+            title_text = selected_order["displayName"]
+            if len(selected_orders) > 1:
+                title_text = f"{selected_order['displayName']} 외 {len(selected_orders) - 1}건"
+            st.markdown(f"### {title_text}")
             related_rows = data["related_by_order"].get(selected_order["id"], [])
             related_options = []
             for row in related_rows:
@@ -2153,14 +2297,20 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 badge_line += style_badge("북미", NA_COLORS)
             st.markdown(badge_line, unsafe_allow_html=True)
 
+            summary_source_orders = selected_orders if selected_orders else [selected_order]
+            min_start = min(order.get("startDate", selected_order["startDate"]) for order in summary_source_orders)
+            max_end = max(order.get("endDate", selected_order["endDate"]) for order in summary_source_orders)
+            total_items = sum(int(order.get("items", 0) or 0) for order in summary_source_orders)
+            total_amount = sum(int(order.get("amount", 0) or 0) for order in summary_source_orders)
+
             compact_cols = st.columns(3)
             compact_cols[0].markdown(
                 f"""
                 <div class="soft-card" style="padding:10px 12px; min-height:unset;">
                     <div class="subtle-title" style="font-size:12px;">확정납기</div>
                     <div style="font-size:13px; font-weight:700; color:#0f172a; line-height:1.35;">
-                        {format_korean_date(selected_order['startDate'])}<br>
-                        ~{format_korean_date(selected_order['endDate'])}
+                        {format_korean_date(min_start)}<br>
+                        ~{format_korean_date(max_end)}
                     </div>
                 </div>
                 """,
@@ -2171,7 +2321,7 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 <div class="soft-card" style="padding:10px 12px; min-height:unset;">
                     <div class="subtle-title" style="font-size:12px;">합계 품목수</div>
                     <div style="font-size:13px; font-weight:700; color:#0f172a;">
-                        {selected_order['items']:,} 품목
+                        {total_items:,} 품목
                     </div>
                 </div>
                 """,
@@ -2182,58 +2332,84 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 <div class="soft-card" style="padding:10px 12px; min-height:unset;">
                     <div class="subtle-title" style="font-size:12px;">합계 수주량</div>
                     <div style="font-size:13px; font-weight:700; color:#0f172a;">
-                        {selected_order.get('amount', 0):,} BOX
+                        {total_amount:,} BOX
                     </div>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
 
-            detail_item_rows = data.get("detail_items_by_order", {}).get(selected_order["id"], [])
-            filtered_detail_item_rows = [
-                row for row in detail_item_rows
-                if not selected_related_labels or row.get("관련 수주번호", "") in selected_related_nos
-            ]
-            display_df = pd.DataFrame(filtered_detail_item_rows)
-            if not display_df.empty:
-                current_order_id = selected_order["id"]
-                if st.session_state.get("item_filter_last_order_id") != current_order_id:
-                    if selected_order.get("isNorthAmerica"):
-                        st.session_state[f"item_standard_filter_{current_order_id}"] = "전체"
-                        st.session_state[f"item_product_filter_{current_order_id}"] = "목제"
-                    else:
-                        st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
-                        st.session_state[f"item_product_filter_{current_order_id}"] = "충주"
-                    st.session_state["item_filter_last_order_id"] = current_order_id
+            current_order_id = selected_order["id"]
+            if st.session_state.get("item_filter_last_order_id") != current_order_id:
+                if selected_order.get("isNorthAmerica"):
+                    st.session_state[f"item_standard_filter_{current_order_id}"] = "전체"
+                    st.session_state[f"item_product_filter_{current_order_id}"] = "목제"
+                else:
+                    st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
+                    st.session_state[f"item_product_filter_{current_order_id}"] = "충주"
+                st.session_state["item_filter_last_order_id"] = current_order_id
 
-                filter_cols = st.columns(2)
-                standard_filter = filter_cols[0].selectbox(
-                    "표준구분",
-                    options=["전체", "주문품"],
-                    key=f"item_standard_filter_{current_order_id}",
-                )
-                product_filter = filter_cols[1].selectbox(
-                    "제품구분",
-                    options=["전체", "충주", "목제"],
-                    key=f"item_product_filter_{current_order_id}",
-                )
+            filter_cols = st.columns(3)
+            standard_filter = filter_cols[0].selectbox(
+                "표준구분",
+                options=["전체", "주문품"],
+                key=f"item_standard_filter_{current_order_id}",
+            )
+            product_filter = filter_cols[1].selectbox(
+                "제품구분",
+                options=["전체", "충주", "목제"],
+                key=f"item_product_filter_{current_order_id}",
+            )
+            return_only_filter = filter_cols[2].toggle(
+                "회수",
+                key=f"item_return_filter_{current_order_id}",
+            )
 
-                if standard_filter == "주문품" and "표준구분" in display_df.columns:
-                    display_df = display_df[display_df["표준구분"].astype(str).str.contains("주문품", na=False)]
-
-                if product_filter != "전체" and "제품구분" in display_df.columns:
+            def build_item_display_df(raw_rows: list[dict]) -> pd.DataFrame:
+                df = pd.DataFrame(raw_rows)
+                if df.empty:
+                    return df
+                if standard_filter == "주문품" and "표준구분" in df.columns:
+                    df = df[df["표준구분"].astype(str).str.contains("주문품", na=False)]
+                if product_filter != "전체" and "제품구분" in df.columns:
                     if product_filter == "충주":
                         allowed_products = {"충주1제품", "충주2제품"}
                     else:
                         allowed_products = {"충주1제품", "충주2제품", "F우레탄제품", "베트남상품", "목제상품", "목제5상품", "목제6상품"}
-                    display_df = display_df[display_df["제품구분"].isin(allowed_products)]
+                    df = df[df["제품구분"].isin(allowed_products)]
+                df = df.rename(columns={"품목명": "단품명칭", "수량": "수주량"})
+                if return_only_filter and "현재고" in df.columns and "수주량" in df.columns:
+                    stock_series = pd.to_numeric(df["현재고"], errors="coerce").fillna(0)
+                    order_qty_series = pd.to_numeric(df["수주량"], errors="coerce").fillna(0)
+                    df = df[stock_series > order_qty_series]
+                if "단품명칭" in df.columns:
+                    df["단품명칭"] = df["단품명칭"].map(shorten_item_name_for_display)
+                wanted_cols = ["대표 수주건명", "제품구분", "단품코드", "색상", "단품명칭", "수주량", "현재고", "확정납기"]
+                return df[[col for col in wanted_cols if col in df.columns]]
 
-                display_df = display_df.rename(columns={"품목명": "단품명칭", "수량": "수주량"})
-                if "단품명칭" in display_df.columns:
-                    display_df["단품명칭"] = display_df["단품명칭"].map(shorten_item_name_for_display)
-                wanted_cols = ["제품구분", "단품코드", "색상", "단품명칭", "수주량", "현재고", "확정납기"]
-                display_df = display_df[[col for col in wanted_cols if col in display_df.columns]]
+            merged_item_rows = []
+            for each_order in summary_source_orders:
+                each_rows = data.get("detail_items_by_order", {}).get(each_order["id"], [])
+                if each_order["id"] == selected_order["id"] and selected_related_labels:
+                    each_rows = [
+                        row for row in each_rows
+                        if row.get("관련 수주번호", "") in selected_related_nos
+                    ]
+                for row in each_rows:
+                    row_copy = dict(row)
+                    row_copy["대표 수주건명"] = each_order.get("displayName", "")
+                    merged_item_rows.append(row_copy)
+            display_df = build_item_display_df(merged_item_rows)
             st.dataframe(display_df, use_container_width=True, hide_index=True)
+            if not display_df.empty:
+                excel_bytes = dataframe_to_styled_excel_bytes(display_df, sheet_name="통합품목")
+                st.download_button(
+                    "서식 적용 엑셀 다운로드",
+                    data=excel_bytes,
+                    file_name=f"통합품목_{date.today().strftime('%Y%m%d')}.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    use_container_width=True,
+                )
 
 def render_metrics(all_orders: list[dict]):
     today = date.today()

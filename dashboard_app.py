@@ -3,9 +3,10 @@ import io
 import json
 import os
 from collections.abc import Mapping
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 import re
+from zoneinfo import ZoneInfo
 
 import gspread
 import pandas as pd
@@ -249,6 +250,10 @@ GOOGLE_SCOPES = [
 ]
 
 
+def today_kst() -> date:
+    return datetime.now(ZoneInfo("Asia/Seoul")).date()
+
+
 def inject_css():
     st.markdown(
         """
@@ -432,6 +437,25 @@ def month_label(month_str: str) -> str:
 def format_korean_date(date_str: str) -> str:
     y, m, d = date_str.split("-")
     return f"{y}년 {int(m)}월 {int(d)}일"
+
+
+def format_korean_amount_unit(amount: int) -> str:
+    value = max(0, int(amount or 0))
+    eok = value // 100_000_000
+    chunman = (value % 100_000_000) // 10_000_000
+    man = (value % 10_000_000) // 10_000
+
+    parts = []
+    if eok:
+        parts.append(f"{eok}억")
+    if chunman:
+        parts.append(f"{chunman}천만")
+    if not eok and not chunman:
+        if man:
+            parts.append(f"{man}만")
+        else:
+            parts.append("0")
+    return " ".join(parts)
 
 
 def clip_text(text: str, limit: int = 22) -> str:
@@ -805,7 +829,7 @@ def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
-def load_dashboard_data():
+def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
     spreadsheet = open_spreadsheet()
     worksheets = spreadsheet.worksheets()
     na_keyword_rows, na_active_keywords = load_north_america_keywords(spreadsheet)
@@ -1016,6 +1040,7 @@ def load_dashboard_data():
             수량=("수주량_num", "sum"),
             품목명=("단품명칭", lambda s: first_nonempty(s, "품목명 없음")),
             제품구분=("제품구분", lambda s: first_nonempty(s, "미분류")),
+            표준구분=("표준구분", lambda s: "주문품" if s.astype(str).str.contains("주문품", na=False).any() else "기타"),
             생산=("생산", "sum"),
             계획=("계획", "sum"),
             잔량=("잔량", "sum"),
@@ -1025,10 +1050,49 @@ def load_dashboard_data():
         )
         .reset_index()
     )
-    candidate_item_agg["주요품목여부"] = candidate_item_agg["수량"] >= 30
+    candidate_item_agg["주요품목여부"] = (
+        candidate_item_agg["표준구분"].astype(str).str.contains("주문품", na=False)
+        & (candidate_item_agg["수량"] >= 30)
+    )
     major_item_agg = candidate_item_agg[candidate_item_agg["주요품목여부"]].copy()
 
     major_group_keys = set(major_item_agg["통합수주건키"].unique())
+    # OR 조건: 주문품 수주금액 합계가 3,000만원 이상이면 주요 수주건으로 인정
+    order_amount_major_keys = set()
+    order_amount_candidate = merged[
+        merged["표준구분"].astype(str).str.contains("주문품", na=False)
+        & merged["제품구분"].isin(["충주1제품", "충주2제품", "F우레탄제품"])
+    ].copy()
+    if not order_amount_candidate.empty:
+        order_amount_agg = (
+            order_amount_candidate.groupby("통합수주건키", dropna=False)
+            .agg(주문품수주금액합계=("수주금액_num", "sum"))
+            .reset_index()
+        )
+        order_amount_major_keys = set(
+            order_amount_agg.loc[
+                order_amount_agg["주문품수주금액합계"] >= 30_000_000,
+                "통합수주건키",
+            ].astype(str)
+        )
+    major_group_keys.update(order_amount_major_keys)
+    # 기타 후보: 표준품/주문품 무관 + 충주1/충주2/F우레탄 제품의 통합 수주금액 합계 1억 이상
+    etc_group_keys = set()
+    etc_amount_candidate = merged[
+        merged["제품구분"].isin(["충주1제품", "충주2제품", "F우레탄제품"])
+    ].copy()
+    if not etc_amount_candidate.empty:
+        etc_amount_agg = (
+            etc_amount_candidate.groupby("통합수주건키", dropna=False)
+            .agg(충주계열수주금액합계=("수주금액_num", "sum"))
+            .reset_index()
+        )
+        etc_group_keys = set(
+            etc_amount_agg.loc[
+                etc_amount_agg["충주계열수주금액합계"] >= int(etc_amount_threshold),
+                "통합수주건키",
+            ].astype(str)
+        )
     office_col_for_export = get_existing_column(merged, ["대표사업소", "사업소", "관리사업소"])
     product_col_for_export = get_existing_column(merged, ["제품구분"])
     standard_col_for_export = get_existing_column(merged, ["표준구분", "수지구분"])
@@ -1072,7 +1136,7 @@ def load_dashboard_data():
         north_america_target_mask = export_mask & north_america_product_mask & north_america_keyword_mask
         north_america_group_keys = set(merged.loc[north_america_target_mask, "통합수주건키"].astype(str).unique())
         major_group_keys.update(north_america_group_keys)
-    grouped_orders = merged[merged["통합수주건키"].isin(major_group_keys)].copy()
+    grouped_orders = merged[merged["통합수주건키"].isin(major_group_keys | etc_group_keys)].copy()
 
     order_records: list[dict] = []
     items_by_order: dict[str, list[dict]] = {}
@@ -1124,7 +1188,7 @@ def load_dashboard_data():
         total_stock_qty = float(major_items["현재고"].sum())
         total_stock_amount = float(major_items["재고금액"].sum())
         progress_rate = 0 if total_plan <= 0 else total_prod / total_plan
-        due_days = (date.fromisoformat(end_date) - date.today()).days
+        due_days = (date.fromisoformat(end_date) - today_kst()).days
 
         if due_days <= 7 and progress_rate < 0.6:
             risk = "높음"
@@ -1192,6 +1256,7 @@ def load_dashboard_data():
                 "progressRate": progress_rate,
                 "isNorthAmerica": is_north_america,
                 "northAmericaKeywords": ", ".join(matching_keywords) if is_north_america else "",
+                "isEtc": group_key in etc_group_keys and group_key not in major_group_keys,
             }
         )
 
@@ -1212,13 +1277,18 @@ def load_dashboard_data():
             for _, row in major_items.sort_values(["수량", "생산"], ascending=[False, False]).iterrows()
         ]
 
+        related_source = group.copy()
+        related_source["_기준수량"] = related_source["수주량_num"].where(
+            related_source["표준구분"].astype(str).str.contains("주문품", na=False),
+            0,
+        )
         related_rows_df = (
-            group.groupby(["수주번호_norm", "수주번호"], dropna=False)
+            related_source.groupby(["수주번호_norm", "수주번호"], dropna=False)
             .agg(
                 관련수주건명=("상세건명", lambda s: first_nonempty(s, representative_name)),
                 확정납기=("확정납기_dt", "max"),
                 사업소=("대표사업소", lambda s: first_nonempty(s, representative_office)),
-                기준수량=("수주량_num", "sum"),
+                기준수량=("_기준수량", "sum"),
             )
             .reset_index()
             .sort_values(["확정납기", "수주번호"])
@@ -1335,6 +1405,12 @@ def initialize_state():
         st.session_state["last_summary_click_ts"] = 0
     if "last_calendar_click_ts" not in st.session_state:
         st.session_state["last_calendar_click_ts"] = 0
+    if "etc_amount_threshold" not in st.session_state:
+        st.session_state["etc_amount_threshold"] = 100_000_000
+    if "etc_amount_threshold_input" not in st.session_state:
+        st.session_state["etc_amount_threshold_input"] = 100_000_000
+    if "etc_amount_threshold_input_text" not in st.session_state:
+        st.session_state["etc_amount_threshold_input_text"] = "100,000,000"
 
 
 def get_filtered_orders(data: dict):
@@ -1363,7 +1439,7 @@ def day_orders(current_day: date, filtered_orders: list[dict]):
 def build_overlay_calendar_payload(filtered_orders: list[dict], selected_month: str, view_style: str):
     year, month = map(int, selected_month.split("-"))
     month_calendar = calendar.Calendar(firstweekday=6).monthdatescalendar(year, month)
-    today = date.today()
+    today = today_kst()
     weeks = []
 
     for week_days in month_calendar:
@@ -1631,7 +1707,7 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
 def render_metrics(filtered_orders: list[dict]):
     selected_month = st.session_state["selected_month"]
     year, month = map(int, selected_month.split("-"))
-    today = date.today()
+    today = today_kst()
     if today.year == year and today.month == month:
         ref_date = today
     else:
@@ -2019,9 +2095,9 @@ def load_north_america_keywords(spreadsheet) -> tuple[list[dict], list[str]]:
 def main():
     inject_css()
     initialize_state()
-    data = load_dashboard_data()
-    available_months = data["available_months"] or [date.today().strftime("%Y-%m")]
-    current_month = date.today().strftime("%Y-%m")
+    data = load_dashboard_data(int(st.session_state.get("etc_amount_threshold", 100_000_000)))
+    available_months = data["available_months"] or [today_kst().strftime("%Y-%m")]
+    current_month = today_kst().strftime("%Y-%m")
     if st.session_state["selected_month"] not in available_months:
         st.session_state["selected_month"] = current_month if current_month in available_months else available_months[-1]
     if st.session_state["selected_order_id"] not in {order["id"] for order in data["orders"]}:
@@ -2043,8 +2119,11 @@ def main():
     filtered_orders = get_filtered_orders(data)
 
     if not filtered_orders:
-        st.warning("현재 조건에 맞는 수주건이 없습니다.")
-        return
+        # 필터 결과가 없어도 캘린더/상세 레이아웃은 유지해서
+        # 사용자가 빈 상태를 동일한 화면 구조에서 확인할 수 있게 한다.
+        st.session_state["detail_metric"] = None
+        st.session_state["detail_order_ids"] = []
+        st.session_state["drilldown_order_id"] = None
 
     render_metrics(filtered_orders)
     render_dialogs(filtered_orders, data)
@@ -2092,7 +2171,7 @@ def render_order_list(filtered_orders: list[dict]):
 def render_metrics(filtered_orders: list[dict]):
     selected_month = st.session_state["selected_month"]
     year, month = map(int, selected_month.split("-"))
-    today = date.today()
+    today = today_kst()
     ref_date = today if (today.year == year and today.month == month) else date(year, month, 1)
 
     week_no = ((ref_date.day - 1) // 7) + 1
@@ -2191,15 +2270,17 @@ def get_filtered_orders(data: dict):
     for order in data["orders"]:
         month_match = order["startDate"].startswith(month_value)
         if business_type == "전체":
-            type_match = True
+            type_match = not bool(order.get("isEtc"))
         elif business_type == "내수":
-            type_match = order["type"] == "내수"
+            type_match = order["type"] == "내수" and not bool(order.get("isEtc"))
         elif business_type == "수출":
             # 수출은 북미 포함
-            type_match = order["type"] == "수출"
+            type_match = order["type"] == "수출" and not bool(order.get("isEtc"))
         elif business_type == "북미":
             # 북미는 수출 중 북미건만
-            type_match = order["type"] == "수출" and bool(order.get("isNorthAmerica"))
+            type_match = order["type"] == "수출" and bool(order.get("isNorthAmerica")) and not bool(order.get("isEtc"))
+        elif business_type == "기타":
+            type_match = bool(order.get("isEtc"))
         else:
             type_match = order["type"] == business_type
         if month_match and type_match:
@@ -2210,7 +2291,7 @@ def get_filtered_orders(data: dict):
 def build_overlay_calendar_payload(filtered_orders: list[dict], selected_month: str, view_style: str):
     year, month = map(int, selected_month.split("-"))
     month_calendar = calendar.Calendar(firstweekday=6).monthdatescalendar(year, month)
-    today = date.today()
+    today = today_kst()
     weeks = []
 
     for week_days in month_calendar:
@@ -2316,7 +2397,7 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             with filter_col1:
                 st.radio(
                     "구분",
-                    options=["전체", "내수", "수출", "북미"],
+                    options=["전체", "내수", "수출", "북미", "기타"],
                     horizontal=True,
                     key="business_type",
                     on_change=on_top_filter_change,
@@ -2329,6 +2410,29 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                     key="selected_month",
                     on_change=on_top_filter_change,
                 )
+            if st.session_state.get("business_type") == "기타":
+                current_threshold = int(st.session_state.get("etc_amount_threshold", 100_000_000))
+                if "etc_amount_threshold_draft" not in st.session_state:
+                    st.session_state["etc_amount_threshold_draft"] = current_threshold
+
+                with st.form("etc_amount_threshold_form", clear_on_submit=False):
+                    st.number_input(
+                        "기타 금액 기준(원)",
+                        min_value=0,
+                        step=10_000_000,
+                        key="etc_amount_threshold_draft",
+                        help="충주1/충주2/F우레탄 제품의 통합 수주금액 합계 기준입니다.",
+                    )
+                    apply_threshold = st.form_submit_button("기준 적용", use_container_width=True)
+
+                draft_threshold = int(st.session_state.get("etc_amount_threshold_draft", current_threshold))
+                st.caption(
+                    f"설정값: {draft_threshold:,}원 ({format_korean_amount_unit(draft_threshold)}원)"
+                )
+
+                if apply_threshold and draft_threshold != current_threshold:
+                    st.session_state["etc_amount_threshold"] = draft_threshold
+                    st.rerun()
             payload = build_overlay_calendar_payload(
                 filtered_orders,
                 st.session_state["selected_month"],
@@ -2491,13 +2595,38 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             )
 
             current_order_id = selected_order["id"]
+            selected_order_rows_for_default = data.get("detail_items_by_order", {}).get(selected_order["id"], [])
+            if selected_related_labels:
+                selected_order_rows_for_default = [
+                    row for row in selected_order_rows_for_default
+                    if row.get("관련 수주번호", "") in selected_related_nos
+                ]
+
+            chgju_products = {"충주1제품", "충주2제품", "F우레탄제품"}
+            wood_products = {"F우레탄제품", "베트남상품", "목제상품", "목제5상품", "목제6상품"}
+
             if st.session_state.get("item_filter_last_order_id") != current_order_id:
                 if selected_order.get("isNorthAmerica"):
                     st.session_state[f"item_standard_filter_{current_order_id}"] = "전체"
                     st.session_state[f"item_product_filter_{current_order_id}"] = "목제"
-                else:
+                elif selected_order.get("type") == "내수":
                     st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
                     st.session_state[f"item_product_filter_{current_order_id}"] = "충주"
+                else:
+                    st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
+                    default_product = "전체"
+                    if selected_order_rows_for_default:
+                        default_df = pd.DataFrame(selected_order_rows_for_default)
+                        if "표준구분" in default_df.columns:
+                            default_df = default_df[
+                                default_df["표준구분"].astype(str).str.contains("주문품", na=False)
+                            ]
+                        product_values = set(default_df.get("제품구분", pd.Series(dtype=str)).astype(str))
+                        if any(product in chgju_products for product in product_values):
+                            default_product = "충주"
+                        elif any(product in wood_products for product in product_values):
+                            default_product = "목제"
+                    st.session_state[f"item_product_filter_{current_order_id}"] = default_product
                 st.session_state["item_filter_last_order_id"] = current_order_id
 
             filter_cols = st.columns(3)
@@ -2516,20 +2645,29 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 key=f"item_return_filter_{current_order_id}",
             )
 
-            def build_item_display_df(raw_rows: list[dict]) -> pd.DataFrame:
+            def build_item_display_df(
+                raw_rows: list[dict],
+                selected_standard_filter: str | None = None,
+                selected_product_filter: str | None = None,
+                selected_return_only_filter: bool | None = None,
+            ) -> pd.DataFrame:
                 df = pd.DataFrame(raw_rows)
                 if df.empty:
                     return df
-                if standard_filter == "주문품" and "표준구분" in df.columns:
+                effective_standard = standard_filter if selected_standard_filter is None else selected_standard_filter
+                effective_product = product_filter if selected_product_filter is None else selected_product_filter
+                effective_return_only = return_only_filter if selected_return_only_filter is None else selected_return_only_filter
+
+                if effective_standard == "주문품" and "표준구분" in df.columns:
                     df = df[df["표준구분"].astype(str).str.contains("주문품", na=False)]
-                if product_filter != "전체" and "제품구분" in df.columns:
-                    if product_filter == "충주":
-                        allowed_products = {"충주1제품", "충주2제품"}
+                if effective_product != "전체" and "제품구분" in df.columns:
+                    if effective_product == "충주":
+                        allowed_products = chgju_products
                     else:
-                        allowed_products = {"충주1제품", "충주2제품", "F우레탄제품", "베트남상품", "목제상품", "목제5상품", "목제6상품"}
+                        allowed_products = chgju_products | wood_products
                     df = df[df["제품구분"].isin(allowed_products)]
                 df = df.rename(columns={"품목명": "단품명칭", "수량": "수주량"})
-                if return_only_filter and "현재고" in df.columns and "수주량" in df.columns:
+                if effective_return_only and "현재고" in df.columns and "수주량" in df.columns:
                     stock_series = pd.to_numeric(df["현재고"], errors="coerce").fillna(0)
                     order_qty_series = pd.to_numeric(df["수주량"], errors="coerce").fillna(0)
                     df = df[stock_series > order_qty_series]
@@ -2551,19 +2689,29 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                     row_copy["대표 수주건명"] = each_order.get("displayName", "")
                     merged_item_rows.append(row_copy)
             display_df = build_item_display_df(merged_item_rows)
+            if display_df.empty and merged_item_rows and product_filter != "전체":
+                fallback_df = build_item_display_df(
+                    merged_item_rows,
+                    selected_standard_filter=standard_filter,
+                    selected_product_filter="전체",
+                    selected_return_only_filter=return_only_filter,
+                )
+                if not fallback_df.empty:
+                    st.info("현재 제품구분 필터 결과가 없어, 제품구분 전체 기준 품목을 표시합니다.")
+                    display_df = fallback_df
             st.dataframe(display_df, use_container_width=True, hide_index=True)
             if not display_df.empty:
                 excel_bytes = dataframe_to_styled_excel_bytes(display_df, sheet_name="통합품목")
                 st.download_button(
                     "서식 적용 엑셀 다운로드",
                     data=excel_bytes,
-                    file_name=f"통합품목_{date.today().strftime('%Y%m%d')}.xlsx",
+                    file_name=f"통합품목_{today_kst().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     use_container_width=True,
                 )
 
 def render_metrics(all_orders: list[dict]):
-    today = date.today()
+    today = today_kst()
     year, month = today.year, today.month
 
     month_weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)
@@ -2639,7 +2787,7 @@ def render_metrics(all_orders: list[dict]):
         st.session_state["detail_order_ids"] = st.session_state.get("na_biweekly_order_ids", [])
 
 def render_metrics(all_orders: list[dict]):
-    today = date.today()
+    today = today_kst()
     year, month = today.year, today.month
 
     month_weeks = calendar.Calendar(firstweekday=0).monthdatescalendar(year, month)

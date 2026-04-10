@@ -439,6 +439,54 @@ def format_korean_date(date_str: str) -> str:
     return f"{y}년 {int(m)}월 {int(d)}일"
 
 
+def extract_snapshot_datetime_from_title(title: str) -> datetime | None:
+    text = str(title or "").strip()
+    if not text:
+        return None
+
+    patterns = [
+        r"(20\d{2})[-/.](\d{2})[-/.](\d{2})[_\-\s](\d{2})(\d{2})(\d{2})?",
+        r"(20\d{2})(\d{2})(\d{2})[_\-\s]?(\d{2})(\d{2})(\d{2})",
+        r"(20\d{2})[-/.](\d{2})[-/.](\d{2})[\sT](\d{2}):(\d{2})(?::(\d{2}))?",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        groups = match.groups()
+        if len(groups) == 6 and groups[5] is None:
+            groups = (*groups[:5], "00")
+        groups = tuple("00" if g is None else g for g in groups)
+        try:
+            y, m, d, hh, mm, ss = [int(v) for v in groups[:6]]
+            return datetime(y, m, d, hh, mm, ss)
+        except ValueError:
+            continue
+
+    date_match = re.search(r"(20\d{2})(\d{2})(\d{2})", text)
+    if date_match:
+        try:
+            y, m, d = [int(v) for v in date_match.groups()]
+            return datetime(y, m, d, 0, 0, 0)
+        except ValueError:
+            return None
+    return None
+
+
+def build_source_snapshot_label(source_titles: dict) -> str:
+    if not isinstance(source_titles, dict):
+        return "기준 시각 확인 불가"
+    parsed = []
+    for title in source_titles.values():
+        dt = extract_snapshot_datetime_from_title(str(title))
+        if dt:
+            parsed.append(dt)
+    if not parsed:
+        return "기준 시각 확인 불가"
+    latest_dt = max(parsed)
+    return latest_dt.strftime("%Y-%m-%d %H:%M")
+
+
 def format_korean_amount_unit(amount: int) -> str:
     value = max(0, int(amount or 0))
     eok = value // 100_000_000
@@ -1526,11 +1574,16 @@ def on_top_filter_change():
     reset_detail_views()
 
 
-def render_header():
+def render_header(data: dict):
+    snapshot_label = build_source_snapshot_label(data.get("source_titles", {}))
     st.markdown(
-        """
+        f"""
         <div class="hero-card">
-            <div style="font-size:34px; font-weight:800; color:#0f172a;">품평/프로젝트 관리</div>
+            <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:16px;">
+                <div style="font-size:34px; font-weight:800; color:#0f172a;">품평/프로젝트 관리</div>
+                <div style="font-size:13px; color:#475569; font-weight:600;">
+                    기준: {snapshot_label}
+                </div>
             </div>
         </div>
         """,
@@ -2115,7 +2168,7 @@ def main():
     if st.session_state["detail_selected_order_id"] not in {order["id"] for order in data["orders"]}:
         st.session_state["detail_selected_order_id"] = st.session_state["selected_order_id"]
 
-    render_header()
+    render_header(data)
     filtered_orders = get_filtered_orders(data)
 
     if not filtered_orders:

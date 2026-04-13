@@ -2,6 +2,7 @@ import calendar
 import io
 import json
 import os
+import math
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -571,6 +572,70 @@ def shorten_item_name_for_display(value: str) -> str:
         if code and short_change:
             return f"{code}-{short_change}"
     return text
+
+
+def with_row_no_and_total(
+    df: pd.DataFrame,
+    qty_candidates: tuple[str, ...] = ("수주량", "수량", "qty"),
+) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    if out.empty:
+        return out
+    out = out.reset_index(drop=True)
+    out.insert(0, "번호", range(1, len(out) + 1))
+
+    qty_col = next((col for col in qty_candidates if col in out.columns), None)
+    if not qty_col:
+        return out
+
+    qty_sum = pd.to_numeric(out[qty_col], errors="coerce").fillna(0).sum()
+    if float(qty_sum).is_integer():
+        qty_sum_value = int(qty_sum)
+    else:
+        qty_sum_value = float(qty_sum)
+
+    total_row = {col: "" for col in out.columns}
+    total_row["번호"] = "합계"
+    total_row[qty_col] = qty_sum_value
+    out = pd.concat([out, pd.DataFrame([total_row])], ignore_index=True)
+    return out
+
+
+def format_number_value(value):
+    if value is None:
+        return ""
+    if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+        return ""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        num = float(value)
+        if num.is_integer():
+            return f"{int(num):,}"
+        return f"{num:,.2f}".rstrip("0").rstrip(".")
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return text
+        normalized = text.replace(",", "")
+        if re.fullmatch(r"-?\d+(\.\d+)?", normalized):
+            try:
+                num = float(normalized)
+                if num.is_integer():
+                    return f"{int(num):,}"
+                return f"{num:,.2f}".rstrip("0").rstrip(".")
+            except Exception:
+                return value
+    return value
+
+
+def format_df_numbers_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in out.columns:
+        out[col] = out[col].map(format_number_value)
+    return out
 
 
 def dataframe_to_styled_excel_bytes(df: pd.DataFrame, sheet_name: str = "통합품목") -> bytes:
@@ -1447,6 +1512,8 @@ def initialize_state():
         st.session_state["detail_metric"] = None
     if "detail_order_ids" not in st.session_state:
         st.session_state["detail_order_ids"] = []
+    if "detail_metric_open_ts" not in st.session_state:
+        st.session_state["detail_metric_open_ts"] = 0
     if "drilldown_order_id" not in st.session_state:
         st.session_state["drilldown_order_id"] = None
     if "last_summary_click_ts" not in st.session_state:
@@ -1567,6 +1634,7 @@ def reset_detail_views():
     st.session_state["detail_metric"] = None
     st.session_state["drilldown_order_id"] = None
     st.session_state["detail_order_ids"] = []
+    st.session_state["detail_metric_open_ts"] = 0
 
 
 def on_top_filter_change():
@@ -1754,7 +1822,11 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             s2.metric("재고금액", f"{selected_order.get('stockAmount', 0):,}")
 
             related_rows = data["related_by_order"].get(selected_order["id"], [])
-            st.dataframe(pd.DataFrame(related_rows), use_container_width=True, hide_index=True)
+            st.dataframe(
+                format_df_numbers_for_display(with_row_no_and_total(pd.DataFrame(related_rows))),
+                use_container_width=True,
+                hide_index=True,
+            )
 
 
 def render_metrics(filtered_orders: list[dict]):
@@ -1813,43 +1885,145 @@ def render_metrics(filtered_orders: list[dict]):
 
 
 @st.dialog("세부내역 보기", width="large")
-def show_metric_detail_dialog(filtered_orders: list[dict]):
+def show_metric_detail_dialog(data: dict, filtered_orders: list[dict]):
     detail_metric = st.session_state.get("detail_metric")
     if not detail_metric:
         st.info("표시할 세부내역이 없습니다.")
         return
-    selected_ids = set(st.session_state.get("detail_order_ids", []))
-    if selected_ids:
-        source_orders = [order for order in filtered_orders if order["id"] in selected_ids]
-    else:
-        source_orders = filtered_orders
 
-    rows = metric_rows(source_orders)[detail_metric]
-    info = METRIC_DETAILS[detail_metric]
-    st.markdown(f"### {info['title']}")
-    st.caption(info["description"])
+    selected_ids = list(dict.fromkeys(st.session_state.get("detail_order_ids", [])))
+    order_pool = filtered_orders if filtered_orders else data.get("orders", [])
+    order_map = {order["id"]: order for order in order_pool}
+    if selected_ids:
+        source_orders = [order_map[order_id] for order_id in selected_ids if order_id in order_map]
+    else:
+        source_orders = order_pool
+
+    st.markdown("### 수주건별 세부 품목 리스트")
+    st.caption("상단 요약 현황에서 선택된 수주건 기준입니다.")
 
     info_cols = st.columns(3)
-    info_cols[0].markdown(f"<div class='soft-card'><div class='subtle-title'>조회 월</div><div style='font-size:22px;font-weight:700;color:#0f172a;'>{month_label(st.session_state['selected_month'])}</div></div>", unsafe_allow_html=True)
-    info_cols[1].markdown(f"<div class='soft-card'><div class='subtle-title'>사업 구분</div><div style='font-size:22px;font-weight:700;color:#0f172a;'>{st.session_state['business_type']}</div></div>", unsafe_allow_html=True)
-    info_cols[2].markdown(f"<div class='soft-card'><div class='subtle-title'>건수</div><div style='font-size:22px;font-weight:700;color:#0f172a;'>{len(rows)}</div></div>", unsafe_allow_html=True)
-
-    detail_df = pd.DataFrame(
-        [{"항목": row["name"], "상세": row["sub"], "값": row["value"]} for row in rows]
+    info_cols[0].markdown(
+        f"<div class='soft-card'><div class='subtle-title'>조회 월</div><div style='font-size:20px;font-weight:700;color:#0f172a;'>{month_label(st.session_state['selected_month'])}</div></div>",
+        unsafe_allow_html=True,
     )
-    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+    info_cols[1].markdown(
+        f"<div class='soft-card'><div class='subtle-title'>사업 구분</div><div style='font-size:20px;font-weight:700;color:#0f172a;'>{st.session_state['business_type']}</div></div>",
+        unsafe_allow_html=True,
+    )
+    info_cols[2].markdown(
+        f"<div class='soft-card'><div class='subtle-title'>선택 수주건</div><div style='font-size:20px;font-weight:700;color:#0f172a;'>{len(source_orders):,}건</div></div>",
+        unsafe_allow_html=True,
+    )
 
-    choose_cols = st.columns(min(4, max(1, len(rows[:4]))))
-    for col, row in zip(choose_cols, rows[:4]):
-        with col:
-            if st.button(f"{clip_text(row['name'], 18)} 품목보기", key=f"drill_{row['order']['id']}", use_container_width=True):
-                st.session_state["detail_metric"] = None
-                st.session_state["drilldown_order_id"] = row["order"]["id"]
-                st.rerun()
+    if st.session_state.get("summary_popup_product_filter") == "목제":
+        st.session_state["summary_popup_product_filter"] = "목제상품"
 
-    if st.button("닫기", key="close_metric_detail", use_container_width=True):
+    filter_cols = st.columns(3)
+    standard_filter = filter_cols[0].selectbox(
+        "표준구분",
+        options=["전체", "표준품", "주문품"],
+        index=2,
+        key="summary_popup_standard_filter",
+    )
+    product_filter = filter_cols[1].selectbox(
+        "제품구분",
+        options=["전체", "충주", "목제상품"],
+        index=1,
+        key="summary_popup_product_filter",
+    )
+    return_only_filter = filter_cols[2].toggle(
+        "회수",
+        key="summary_popup_return_filter",
+    )
+
+    chgju_products = {"충주1제품", "충주2제품", "F우레탄제품"}
+    wood_products = {"F우레탄제품", "베트남상품", "목제상품", "목제5상품", "목제6상품"}
+
+    merged_item_rows = []
+    for order in source_orders:
+        for row in data.get("detail_items_by_order", {}).get(order["id"], []):
+            row_copy = dict(row)
+            row_copy["대표 수주건명"] = order.get("displayName", "")
+            merged_item_rows.append(row_copy)
+
+    display_df = pd.DataFrame(merged_item_rows)
+    if not display_df.empty:
+        if standard_filter in {"주문품", "표준품"} and "표준구분" in display_df.columns:
+            display_df = display_df[display_df["표준구분"].astype(str).str.contains(standard_filter, na=False)]
+        if product_filter != "전체" and "제품구분" in display_df.columns:
+            if product_filter == "충주":
+                allowed_products = chgju_products
+            else:
+                allowed_products = chgju_products | wood_products
+            display_df = display_df[display_df["제품구분"].isin(allowed_products)]
+
+        display_df = display_df.rename(columns={"품목명": "단품명칭", "수량": "수주량"})
+        if return_only_filter and "현재고" in display_df.columns and "수주량" in display_df.columns:
+            stock_series = pd.to_numeric(display_df["현재고"], errors="coerce").fillna(0)
+            order_qty_series = pd.to_numeric(display_df["수주량"], errors="coerce").fillna(0)
+            display_df = display_df[stock_series > order_qty_series]
+        if "단품명칭" in display_df.columns:
+            display_df["단품명칭"] = display_df["단품명칭"].map(shorten_item_name_for_display)
+
+    wanted_cols = ["대표 수주건명", "제품구분", "단품코드", "색상", "단품명칭", "수주량", "현재고", "확정납기"]
+    display_df = display_df[[col for col in wanted_cols if col in display_df.columns]] if not display_df.empty else display_df
+
+    if not display_df.empty:
+        if {"단품코드", "색상"}.issubset(display_df.columns):
+            popup_total_items = int(
+                display_df[["단품코드", "색상"]].astype(str).drop_duplicates().shape[0]
+            )
+        else:
+            popup_total_items = int(len(display_df))
+        popup_total_amount = int(
+            pd.to_numeric(display_df.get("수주량", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()
+        )
+    else:
+        popup_total_items = 0
+        popup_total_amount = 0
+
+    sum_cols = st.columns(2)
+    sum_cols[0].markdown(
+        f"<div class='soft-card'><div class='subtle-title'>합계 품목수</div><div style='font-size:20px;font-weight:700;color:#0f172a;'>{popup_total_items:,} 품목</div></div>",
+        unsafe_allow_html=True,
+    )
+    sum_cols[1].markdown(
+        f"<div class='soft-card'><div class='subtle-title'>합계 수주량</div><div style='font-size:20px;font-weight:700;color:#0f172a;'>{popup_total_amount:,} BOX</div></div>",
+        unsafe_allow_html=True,
+    )
+
+    if display_df.empty:
+        st.info("현재 필터 기준으로 표시할 품목이 없습니다.")
+    else:
+        display_df_view = with_row_no_and_total(display_df)
+        st.dataframe(format_df_numbers_for_display(display_df_view), use_container_width=True, hide_index=True)
+    action_cols = st.columns(2)
+    with action_cols[0]:
+        if display_df.empty:
+            st.button(
+                "다운로드 (.xlsx)",
+                key="summary_popup_download_excel_disabled",
+                disabled=True,
+                use_container_width=True,
+            )
+        else:
+            excel_bytes = dataframe_to_styled_excel_bytes(display_df_view, sheet_name="통합품목")
+            st.download_button(
+                "다운로드 (.xlsx)",
+                data=excel_bytes,
+                file_name=f"통합품목_요약팝업_{today_kst().strftime('%Y%m%d')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="summary_popup_download_excel",
+            )
+    with action_cols[1]:
+        close_clicked = st.button("닫기", key="close_metric_detail", use_container_width=True)
+
+    if close_clicked:
         st.session_state["detail_metric"] = None
         st.session_state["detail_order_ids"] = []
+        st.session_state["detail_metric_open_ts"] = 0
         st.rerun()
 
 
@@ -1871,7 +2045,11 @@ def show_drilldown_dialog(data: dict):
 
     item_df = pd.DataFrame(data["items_by_order"].get(drill_id, []))
     item_df = item_df.rename(columns={"name": "품목명", "spec": "규격", "color": "색상", "qty": "수량", "code": "단품코드", "produced": "생산", "planned": "계획", "remaining": "잔량", "stockQty": "현재고", "stockAmount": "재고금액", "status": "진행상태"})
-    st.dataframe(item_df, use_container_width=True, hide_index=True)
+    st.dataframe(
+        format_df_numbers_for_display(with_row_no_and_total(item_df)),
+        use_container_width=True,
+        hide_index=True,
+    )
 
     if st.button("닫기", key="close_drilldown_detail", use_container_width=True):
         st.session_state["drilldown_order_id"] = None
@@ -1885,7 +2063,7 @@ def render_dialogs(filtered_orders: list[dict], data: dict):
         st.session_state["detail_metric"] = None
         show_drilldown_dialog(data)
     elif st.session_state.get("detail_metric"):
-        show_metric_detail_dialog(data.get("orders", filtered_orders))
+        show_metric_detail_dialog(data, filtered_orders)
 
 
 def render_calendar_and_detail(filtered_orders: list[dict], data: dict, available_months: list[str]):
@@ -2008,7 +2186,11 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
 
             st.markdown("### 동일한 통합 수주건으로 묶인 관련 정보")
             related_rows = data["related_by_order"].get(selected_order["id"], [])
-            st.dataframe(pd.DataFrame(related_rows), use_container_width=True, hide_index=True)
+            st.dataframe(
+                format_df_numbers_for_display(with_row_no_and_total(pd.DataFrame(related_rows))),
+                use_container_width=True,
+                hide_index=True,
+            )
 
             action_cols = st.columns(3)
             action_cols[0].button("공유", key="share_btn", use_container_width=True)
@@ -2179,8 +2361,10 @@ def main():
         st.session_state["drilldown_order_id"] = None
 
     render_metrics(filtered_orders)
-    render_dialogs(filtered_orders, data)
+    # Calendar interaction can update/clear popup state.
+    # Render dialogs after calendar handling to avoid popup flash.
     render_calendar_and_detail(filtered_orders, data, available_months)
+    render_dialogs(filtered_orders, data)
 
 
 def render_order_list(filtered_orders: list[dict]):
@@ -2521,27 +2705,30 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             is_new_calendar_click = clicked_ts_int > 0 and clicked_ts_int != last_calendar_ts
             if is_new_calendar_click:
                 st.session_state["last_calendar_click_ts"] = clicked_ts_int
+            calendar_bar_clicked = (
+                is_new_calendar_click
+                and bool(clicked_order_id)
+                and clicked_order_id in valid_ids
+            )
 
             changed = False
-            if is_new_calendar_click and selected_keys_from_component is not None:
+            if calendar_bar_clicked and selected_keys_from_component is not None:
                 if selected_keys_from_component != st.session_state.get("selected_order_ids", []):
                     st.session_state["selected_order_ids"] = selected_keys_from_component
                     changed = True
-            if is_new_calendar_click and clicked_order_id and clicked_order_id in valid_ids and clicked_order_id != st.session_state["selected_order_id"]:
+            if calendar_bar_clicked and clicked_order_id != st.session_state["selected_order_id"]:
                 st.session_state["selected_order_id"] = clicked_order_id
                 st.session_state["detail_selected_order_id"] = clicked_order_id
                 if clicked_order_id not in st.session_state.get("selected_order_ids", []):
                     st.session_state["selected_order_ids"] = [clicked_order_id]
                 changed = True
-            if is_new_calendar_click and (
-                st.session_state.get("detail_metric") is not None
-                or st.session_state.get("drilldown_order_id") is not None
-                or bool(st.session_state.get("detail_order_ids"))
-            ):
-                st.session_state["detail_metric"] = None
-                st.session_state["detail_order_ids"] = []
-                st.session_state["drilldown_order_id"] = None
-                changed = True
+            if calendar_bar_clicked and st.session_state.get("detail_metric") is not None:
+                opened_ts = int(st.session_state.get("detail_metric_open_ts", 0))
+                # Close summary popup only on a genuinely newer calendar click.
+                if clicked_ts_int > opened_ts:
+                    st.session_state["detail_metric"] = None
+                    st.session_state["detail_order_ids"] = []
+                    changed = True
             if changed:
                 st.rerun()
 
@@ -2606,46 +2793,10 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             st.markdown(badge_line, unsafe_allow_html=True)
 
             summary_source_orders = selected_orders if selected_orders else [selected_order]
-            min_start = min(order.get("startDate", selected_order["startDate"]) for order in summary_source_orders)
-            max_end = max(order.get("endDate", selected_order["endDate"]) for order in summary_source_orders)
-            total_items = sum(int(order.get("items", 0) or 0) for order in summary_source_orders)
-            total_amount = sum(int(order.get("amount", 0) or 0) for order in summary_source_orders)
-
             compact_cols = st.columns(3)
-            compact_cols[0].markdown(
-                f"""
-                <div class="soft-card" style="padding:10px 12px; min-height:unset;">
-                    <div class="subtle-title" style="font-size:12px;">확정납기</div>
-                    <div style="font-size:13px; font-weight:700; color:#0f172a; line-height:1.35;">
-                        {format_korean_date(min_start)}<br>
-                        ~{format_korean_date(max_end)}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            compact_cols[1].markdown(
-                f"""
-                <div class="soft-card" style="padding:10px 12px; min-height:unset;">
-                    <div class="subtle-title" style="font-size:12px;">합계 품목수</div>
-                    <div style="font-size:13px; font-weight:700; color:#0f172a;">
-                        {total_items:,} 품목
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            compact_cols[2].markdown(
-                f"""
-                <div class="soft-card" style="padding:10px 12px; min-height:unset;">
-                    <div class="subtle-title" style="font-size:12px;">합계 수주량</div>
-                    <div style="font-size:13px; font-weight:700; color:#0f172a;">
-                        {total_amount:,} BOX
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            due_card_placeholder = compact_cols[0].empty()
+            item_card_placeholder = compact_cols[1].empty()
+            qty_card_placeholder = compact_cols[2].empty()
 
             current_order_id = selected_order["id"]
             selected_order_rows_for_default = data.get("detail_items_by_order", {}).get(selected_order["id"], [])
@@ -2661,7 +2812,7 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
             if st.session_state.get("item_filter_last_order_id") != current_order_id:
                 if selected_order.get("isNorthAmerica"):
                     st.session_state[f"item_standard_filter_{current_order_id}"] = "전체"
-                    st.session_state[f"item_product_filter_{current_order_id}"] = "목제"
+                    st.session_state[f"item_product_filter_{current_order_id}"] = "목제상품"
                 elif selected_order.get("type") == "내수":
                     st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
                     st.session_state[f"item_product_filter_{current_order_id}"] = "충주"
@@ -2678,20 +2829,24 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                         if any(product in chgju_products for product in product_values):
                             default_product = "충주"
                         elif any(product in wood_products for product in product_values):
-                            default_product = "목제"
+                            default_product = "목제상품"
                     st.session_state[f"item_product_filter_{current_order_id}"] = default_product
                 st.session_state["item_filter_last_order_id"] = current_order_id
+
+            current_product_key = f"item_product_filter_{current_order_id}"
+            if st.session_state.get(current_product_key) == "목제":
+                st.session_state[current_product_key] = "목제상품"
 
             filter_cols = st.columns(3)
             standard_filter = filter_cols[0].selectbox(
                 "표준구분",
-                options=["전체", "주문품"],
+                options=["전체", "표준품", "주문품"],
                 key=f"item_standard_filter_{current_order_id}",
             )
             product_filter = filter_cols[1].selectbox(
                 "제품구분",
-                options=["전체", "충주", "목제"],
-                key=f"item_product_filter_{current_order_id}",
+                options=["전체", "충주", "목제상품"],
+                key=current_product_key,
             )
             return_only_filter = filter_cols[2].toggle(
                 "회수",
@@ -2711,8 +2866,8 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 effective_product = product_filter if selected_product_filter is None else selected_product_filter
                 effective_return_only = return_only_filter if selected_return_only_filter is None else selected_return_only_filter
 
-                if effective_standard == "주문품" and "표준구분" in df.columns:
-                    df = df[df["표준구분"].astype(str).str.contains("주문품", na=False)]
+                if effective_standard in {"주문품", "표준품"} and "표준구분" in df.columns:
+                    df = df[df["표준구분"].astype(str).str.contains(effective_standard, na=False)]
                 if effective_product != "전체" and "제품구분" in df.columns:
                     if effective_product == "충주":
                         allowed_products = chgju_products
@@ -2752,15 +2907,82 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                 if not fallback_df.empty:
                     st.info("현재 제품구분 필터 결과가 없어, 제품구분 전체 기준 품목을 표시합니다.")
                     display_df = fallback_df
-            st.dataframe(display_df, use_container_width=True, hide_index=True)
+
+            # Summary cards should follow exactly the same filtered rows shown in the table.
+            if not display_df.empty and "확정납기" in display_df.columns:
+                due_series = pd.to_datetime(display_df["확정납기"], errors="coerce").dropna()
+            else:
+                due_series = pd.Series(dtype="datetime64[ns]")
+
+            if not due_series.empty:
+                min_start = due_series.min().date().isoformat()
+                max_end = due_series.max().date().isoformat()
+            else:
+                min_start = min(order.get("startDate", selected_order["startDate"]) for order in summary_source_orders)
+                max_end = max(order.get("endDate", selected_order["endDate"]) for order in summary_source_orders)
+
             if not display_df.empty:
-                excel_bytes = dataframe_to_styled_excel_bytes(display_df, sheet_name="통합품목")
+                if {"단품코드", "색상"}.issubset(display_df.columns):
+                    total_items = int(
+                        display_df[["단품코드", "색상"]]
+                        .astype(str)
+                        .drop_duplicates()
+                        .shape[0]
+                    )
+                else:
+                    total_items = int(len(display_df))
+                if "수주량" in display_df.columns:
+                    total_amount = int(pd.to_numeric(display_df["수주량"], errors="coerce").fillna(0).sum())
+                else:
+                    total_amount = 0
+            else:
+                total_items = 0
+                total_amount = 0
+
+            due_card_placeholder.markdown(
+                f"""
+                <div class="soft-card" style="padding:10px 12px; min-height:unset;">
+                    <div class="subtle-title" style="font-size:12px;">확정납기</div>
+                    <div style="font-size:13px; font-weight:700; color:#0f172a; line-height:1.35;">
+                        {format_korean_date(min_start)}<br>
+                        ~{format_korean_date(max_end)}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            item_card_placeholder.markdown(
+                f"""
+                <div class="soft-card" style="padding:10px 12px; min-height:unset;">
+                    <div class="subtle-title" style="font-size:12px;">합계 품목수</div>
+                    <div style="font-size:13px; font-weight:700; color:#0f172a;">
+                        {total_items:,} 품목
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            qty_card_placeholder.markdown(
+                f"""
+                <div class="soft-card" style="padding:10px 12px; min-height:unset;">
+                    <div class="subtle-title" style="font-size:12px;">합계 수주량</div>
+                    <div style="font-size:13px; font-weight:700; color:#0f172a;">
+                        {total_amount:,} BOX
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            display_df_view = with_row_no_and_total(display_df)
+            st.dataframe(format_df_numbers_for_display(display_df_view), use_container_width=True, hide_index=True)
+            if not display_df.empty:
+                excel_bytes = dataframe_to_styled_excel_bytes(display_df_view, sheet_name="통합품목")
                 st.download_button(
-                    "서식 적용 엑셀 다운로드",
+                    "다운로드 (.xlsx)",
                     data=excel_bytes,
                     file_name=f"통합품목_{today_kst().strftime('%Y%m%d')}.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    use_container_width=True,
+                    use_container_width=False,
                 )
 
 def render_metrics(all_orders: list[dict]):
@@ -2854,8 +3076,8 @@ def render_metrics(all_orders: list[dict]):
 
     month_start = date(year, month, 1)
     month_end = date(year, month, calendar.monthrange(year, month)[1])
-    two_week_start = today
-    two_week_end = today + timedelta(days=14)
+    due_soon_start = today
+    due_soon_end = today + timedelta(days=3)
 
     def overlaps_range(order: dict, start_day: date, end_day: date) -> bool:
         start = date.fromisoformat(order["startDate"])
@@ -2864,15 +3086,18 @@ def render_metrics(all_orders: list[dict]):
 
     weekly_orders = [order for order in all_orders if overlaps_range(order, week_start, week_end)]
     monthly_orders = [order for order in all_orders if overlaps_range(order, month_start, month_end)]
-    north_america_two_week_orders = [
-        order
-        for order in all_orders
-        if order.get("isNorthAmerica") and overlaps_range(order, two_week_start, two_week_end)
-    ]
+    due_soon_orders = []
+    for order in all_orders:
+        try:
+            due_day = date.fromisoformat(order["endDate"])
+        except Exception:
+            continue
+        if due_soon_start <= due_day <= due_soon_end:
+            due_soon_orders.append(order)
 
     st.session_state["weekly_order_ids"] = [order["id"] for order in weekly_orders]
     st.session_state["monthly_order_ids"] = [order["id"] for order in monthly_orders]
-    st.session_state["na_biweekly_order_ids"] = [order["id"] for order in north_america_two_week_orders]
+    st.session_state["due_soon_order_ids"] = [order["id"] for order in due_soon_orders]
 
     weekly_export = sum(1 for order in weekly_orders if order["type"] == "수출")
     weekly_domestic = sum(1 for order in weekly_orders if order["type"] == "내수")
@@ -2893,10 +3118,10 @@ def render_metrics(all_orders: list[dict]):
             "partial": f"수출 {monthly_export:,}건 / 내수 {monthly_domestic:,}건",
         },
         {
-            "key": "na_biweekly",
-            "subtitle": f"북미 수주건 {two_week_start.month}/{two_week_start.day}~{two_week_end.month}/{two_week_end.day}",
-            "total": f"{len(north_america_two_week_orders):,}",
-            "partial": "기준: 대리점/실적대리점",
+            "key": "due_soon",
+            "subtitle": "납기 임박건 (D-3)",
+            "total": f"{len(due_soon_orders):,}",
+            "partial": f"기준: {due_soon_start.month}/{due_soon_start.day}~{due_soon_end.month}/{due_soon_end.day}",
         },
     ]
 
@@ -2905,15 +3130,37 @@ def render_metrics(all_orders: list[dict]):
         key="summary_cards_click",
         default=None,
     )
-    if clicked_summary == "weekly":
+    clicked_summary_key = None
+    clicked_summary_ts = 0
+    if isinstance(clicked_summary, dict):
+        clicked_summary_key = clicked_summary.get("key")
+        try:
+            clicked_summary_ts = int(clicked_summary.get("ts") or 0)
+        except Exception:
+            clicked_summary_ts = 0
+    elif isinstance(clicked_summary, str):
+        clicked_summary_key = clicked_summary
+
+    last_summary_ts = int(st.session_state.get("last_summary_click_ts", 0))
+    is_new_summary_click = clicked_summary_ts > 0 and clicked_summary_ts != last_summary_ts
+    if is_new_summary_click:
+        st.session_state["last_summary_click_ts"] = clicked_summary_ts
+
+    if not is_new_summary_click:
+        return
+
+    if clicked_summary_key == "weekly":
         st.session_state["detail_metric"] = "totalOrders"
         st.session_state["detail_order_ids"] = st.session_state.get("weekly_order_ids", [])
-    elif clicked_summary == "monthly":
+        st.session_state["detail_metric_open_ts"] = clicked_summary_ts
+    elif clicked_summary_key == "monthly":
         st.session_state["detail_metric"] = "groupedCount"
         st.session_state["detail_order_ids"] = st.session_state.get("monthly_order_ids", [])
-    elif clicked_summary == "na_biweekly":
+        st.session_state["detail_metric_open_ts"] = clicked_summary_ts
+    elif clicked_summary_key == "due_soon":
         st.session_state["detail_metric"] = "totalOrders"
-        st.session_state["detail_order_ids"] = st.session_state.get("na_biweekly_order_ids", [])
+        st.session_state["detail_order_ids"] = st.session_state.get("due_soon_order_ids", [])
+        st.session_state["detail_metric_open_ts"] = clicked_summary_ts
 
 
 if __name__ == "__main__":

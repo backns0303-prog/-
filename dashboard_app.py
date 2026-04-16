@@ -960,6 +960,10 @@ def load_dashboard_data(
                 latest_titles[key] = "(미연결)"
                 frames[key] = pd.DataFrame(columns=["단품코드", "색상", "현재고", "재고금액", "기간총입고", "기간총출고"])
                 continue
+            if key == "progress":
+                latest_titles[key] = "(미연결)"
+                frames[key] = pd.DataFrame(columns=["단품코드", "색상", "계획", "생산", "잔량", "진행률", "진행상태", "관리번호"])
+                continue
             raise ValueError(f"'{prefix}'로 시작하는 시트를 찾지 못했습니다.")
         latest = sorted(matches, key=lambda ws: ws.title)[-1]
         latest_titles[key] = latest.title
@@ -1011,22 +1015,25 @@ def load_dashboard_data(
         }
     )
 
-    progress["계획_num"] = to_numeric(progress["계획"])
-    progress["생산_num"] = to_numeric(progress["생산"])
-    progress["잔량_num"] = to_numeric(progress["잔량"])
-    progress["진행률_num"] = to_numeric(progress["진행률"])
-    progress_agg = (
-        progress.groupby(["단품코드", "색상"], dropna=False)
-        .agg(
-            계획=("계획_num", "sum"),
-            생산=("생산_num", "sum"),
-            잔량=("잔량_num", "sum"),
-            평균진행률=("진행률_num", "max"),
-            진행상태=("진행상태", lambda s: first_nonempty(s, "미확인")),
-            관리번호수=("관리번호", "nunique"),
+    if not progress.empty:
+        progress["계획_num"] = to_numeric(progress.get("계획", pd.Series(dtype=object)))
+        progress["생산_num"] = to_numeric(progress.get("생산", pd.Series(dtype=object)))
+        progress["잔량_num"] = to_numeric(progress.get("잔량", pd.Series(dtype=object)))
+        progress["진행률_num"] = to_numeric(progress.get("진행률", pd.Series(dtype=object)))
+        progress_agg = (
+            progress.groupby(["단품코드", "색상"], dropna=False)
+            .agg(
+                계획=("계획_num", "sum"),
+                생산=("생산_num", "sum"),
+                잔량=("잔량_num", "sum"),
+                평균진행률=("진행률_num", "max"),
+                진행상태=("진행상태", lambda s: first_nonempty(s, "미확인")),
+                관리번호수=("관리번호", "nunique"),
+            )
+            .reset_index()
         )
-        .reset_index()
-    )
+    else:
+        progress_agg = pd.DataFrame(columns=["단품코드", "색상", "계획", "생산", "잔량", "평균진행률", "진행상태", "관리번호수"])
 
     if not inventory.empty:
         inventory["현재고_num"] = to_numeric(inventory.get("현재고", pd.Series(dtype=object)))

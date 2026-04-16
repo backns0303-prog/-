@@ -1,6 +1,8 @@
-import argparse
+﻿import argparse
 import math
+import random
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -80,8 +82,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-rows-per-batch",
         type=positive_int,
-        default=1000,
+        default=3000,
         help="How many rows to upload per API call.",
+    )
+    parser.add_argument(
+        "--max-write-requests-per-minute",
+        type=positive_int,
+        default=35,
+        help="Throttle Google Sheets write calls to this per-minute rate for stability.",
+    )
+    parser.add_argument(
+        "--max-write-retries",
+        type=non_negative_int,
+        default=8,
+        help="How many times to retry a write chunk on transient API errors (429/5xx).",
     )
     parser.add_argument(
         "--dry-run",
@@ -130,6 +144,18 @@ def classify_columns(columns: list[str]) -> str:
         normalized_required = {normalize_col_name(col) for col in required}
         if normalized_required.issubset(colset):
             return label
+
+    # Inventory sample format fallback:
+    # e.g. 품목코드/색상/재고구분/현재고 + daily forecast columns.
+    inventory_sample_required = {
+        normalize_col_name("품목코드"),
+        normalize_col_name("색상"),
+        normalize_col_name("재고구분"),
+        normalize_col_name("현재고"),
+    }
+    if inventory_sample_required.issubset(colset):
+        return "재고현황"
+
     return "미분류"
 
 
@@ -172,11 +198,48 @@ def get_or_create_worksheet(spreadsheet, title: str, rows: int, cols: int):
         return spreadsheet.add_worksheet(title=title, rows=max(rows, 1), cols=max(cols, 1))
 
 
-def upload_values(worksheet, values: list[list[str]], max_rows_per_batch: int) -> None:
+def is_retryable_api_error(exc: gspread.APIError) -> bool:
+    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+    if status_code in {429, 500, 502, 503, 504}:
+        return True
+    message = str(exc).lower()
+    return "quota" in message or "rate" in message or "timeout" in message
+
+
+def upload_values(
+    worksheet,
+    values: list[list[str]],
+    max_rows_per_batch: int,
+    max_write_requests_per_minute: int,
+    max_write_retries: int,
+) -> None:
+    write_interval_seconds = 60.0 / max(max_write_requests_per_minute, 1)
+    next_allowed_ts = 0.0
+
     for start in range(0, len(values), max_rows_per_batch):
         chunk = values[start : start + max_rows_per_batch]
         cell = f"A{start + 1}"
-        worksheet.update(range_name=cell, values=chunk)
+        attempt = 0
+        while True:
+            now = time.monotonic()
+            if now < next_allowed_ts:
+                time.sleep(next_allowed_ts - now)
+
+            try:
+                worksheet.update(range_name=cell, values=chunk)
+                next_allowed_ts = time.monotonic() + write_interval_seconds
+                break
+            except gspread.APIError as exc:
+                if (not is_retryable_api_error(exc)) or attempt >= max_write_retries:
+                    raise
+                status_code = getattr(getattr(exc, "response", None), "status_code", "unknown")
+                backoff = min(90.0, (2 ** attempt)) + random.uniform(0.2, 0.8)
+                print(
+                    f"  write retry -> row={start + 1} status={status_code} "
+                    f"attempt={attempt + 1}/{max_write_retries} wait={backoff:.1f}s"
+                )
+                time.sleep(backoff)
+                attempt += 1
 
 
 def plan_daily_cleanup(spreadsheet):
@@ -328,8 +391,11 @@ def free_cells_for_upload(
         )
 
 
-def read_excel_file(path: Path) -> pd.DataFrame:
-    return pd.read_excel(path, dtype=object)
+def read_excel_file(path: Path) -> list[tuple[str, pd.DataFrame]]:
+    workbook = pd.read_excel(path, sheet_name=None, dtype=object)
+    if not isinstance(workbook, dict):
+        return [("Sheet1", workbook)]
+    return [(str(sheet_name), sheet_df) for sheet_name, sheet_df in workbook.items()]
 
 
 def preprocess_dataframe(df: pd.DataFrame, label: str) -> pd.DataFrame:
@@ -339,6 +405,23 @@ def preprocess_dataframe(df: pd.DataFrame, label: str) -> pd.DataFrame:
     # so repeated values must be filled from the previous row.
     if label == "공정 진행정보":
         processed = processed.ffill()
+
+    # Inventory sample headers can differ from dashboard join keys.
+    # Normalize key columns so dashboard code can reuse the uploaded sheet directly.
+    if label == "재고현황":
+        normalized_col_map = {normalize_col_name(col): col for col in processed.columns}
+        rename_map = {}
+        alias_candidates = [
+            ("품목코드", "단품코드"),
+            ("(기간)총입고예정", "기간총입고"),
+            ("(기간)총출고예정", "기간총출고"),
+        ]
+        for src_alias, target_name in alias_candidates:
+            src_norm = normalize_col_name(src_alias)
+            if src_norm in normalized_col_map:
+                rename_map[normalized_col_map[src_norm]] = target_name
+        if rename_map:
+            processed = processed.rename(columns=rename_map)
 
     return processed
 
@@ -361,23 +444,28 @@ def main() -> None:
     read_errors = []
     for path in files:
         try:
-            raw_df = read_excel_file(path)
+            sheets = read_excel_file(path)
         except Exception as exc:
             if args.skip_read_errors:
                 read_errors.append((path, exc))
                 continue
             raise SystemExit(f"Failed to read '{path.name}': {exc}") from exc
-        label = classify_columns(list(raw_df.columns))
-        df = preprocess_dataframe(raw_df, label)
-        raw_jobs.append(
-            {
-                "path": path,
-                "label": label,
-                "rows": len(df),
-                "cols": len(df.columns),
-                "df": df,
-            }
-        )
+        for sheet_name, raw_df in sheets:
+            if raw_df is None or len(raw_df.columns) == 0:
+                continue
+            label = classify_columns(list(raw_df.columns))
+            df = preprocess_dataframe(raw_df, label)
+            raw_jobs.append(
+                {
+                    "path": path,
+                    "sheet_name": sheet_name,
+                    "source_name": f"{path.name}#{sheet_name}",
+                    "label": label,
+                    "rows": len(df),
+                    "cols": len(df.columns),
+                    "df": df,
+                }
+            )
 
     if not raw_jobs:
         raise SystemExit("No readable files to upload.")
@@ -390,6 +478,7 @@ def main() -> None:
             jobs_by_label[label] = {
                 "label": label,
                 "paths": [job["path"]],
+                "source_names": [job["source_name"]],
                 "df": job["df"],
             }
             continue
@@ -400,9 +489,10 @@ def main() -> None:
         if not same_columns_in_order(existing_df, incoming_df):
             raise SystemExit(
                 f"Cannot merge files for label '{label}' because column headers differ. "
-                f"first={existing['paths'][0].name}, second={job['path'].name}"
+                f"first={existing['source_names'][0]}, second={job['source_name']}"
             )
         existing["paths"].append(job["path"])
+        existing["source_names"].append(job["source_name"])
         existing["df"] = pd.concat([existing_df, incoming_df], ignore_index=True)
 
     jobs = []
@@ -413,6 +503,7 @@ def main() -> None:
             {
                 "path": merged["paths"][0],
                 "source_paths": merged["paths"],
+                "source_names": merged["source_names"],
                 "label": label,
                 "rows": len(merged_df),
                 "cols": len(merged_df.columns),
@@ -437,7 +528,7 @@ def main() -> None:
 
     print("upload plan:")
     for job in jobs:
-        source_names = ",".join(path.name for path in job["source_paths"])
+        source_names = ",".join(job["source_names"])
         print(
             f"- files={source_names} "
             f"type={job['label']} "
@@ -478,7 +569,13 @@ def main() -> None:
                 rows=rows,
                 cols=cols,
             )
-            upload_values(worksheet, values, args.max_rows_per_batch)
+            upload_values(
+                worksheet=worksheet,
+                values=values,
+                max_rows_per_batch=args.max_rows_per_batch,
+                max_write_requests_per_minute=args.max_write_requests_per_minute,
+                max_write_retries=args.max_write_retries,
+            )
             print(f"  uploaded -> {job['worksheet_title']}")
 
     if args.cleanup_daily:
@@ -493,8 +590,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    def non_negative_int(value: str) -> int:
-        parsed = int(value)
-        if parsed < 0:
-            raise argparse.ArgumentTypeError("must be a non-negative integer")
-        return parsed

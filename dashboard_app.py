@@ -977,6 +977,89 @@ def select_columns_with_defaults(df: pd.DataFrame, columns: list[str]) -> pd.Dat
     return selected.fillna("")
 
 
+def _find_next_days(start_day: date, count: int = 7) -> list[date]:
+    return [start_day + timedelta(days=offset) for offset in range(1, count + 1)]
+
+
+def compute_inventory_d5_metrics(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
+    if df.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+    date_col_info: list[tuple[int, str, date]] = []
+    for idx, col in enumerate(df.columns):
+        try:
+            day = date.fromisoformat(str(col))
+            date_col_info.append((idx, col, day))
+        except Exception:
+            continue
+    if not date_col_info:
+        empty = pd.Series([math.nan] * len(df), index=df.index, dtype=float)
+        return empty, empty
+
+    first_row = df.iloc[0] if len(df) > 0 else pd.Series(dtype=object)
+    markers = {"출예", "물입예", "예량"}
+    first_row_marker_count = 0
+    if not first_row.empty:
+        first_row_marker_count = int(
+            sum(str(v).strip() in markers for v in first_row.values)
+        )
+    marker_row_exists = first_row_marker_count >= 6
+
+    # D+7 구간은 비근무일 포함한 달력일 기준으로 본다.
+    target_days = _find_next_days(today_kst(), count=7)
+    target_day_set = set(target_days)
+    selected_date_cols = [info for info in date_col_info if info[2] in target_day_set]
+    if not selected_date_cols:
+        empty = pd.Series([math.nan] * len(df), index=df.index, dtype=float)
+        return empty, empty
+
+    qty_cols: list[str] = []
+    out_cols: list[str] = []
+    columns_list = list(df.columns)
+    for col_idx, date_col, _ in selected_date_cols:
+        qty_col = date_col
+        out_col = date_col
+        if marker_row_exists:
+            candidates = []
+            for shift in [0, 1, 2, 3]:
+                pos = col_idx + shift
+                if pos >= len(columns_list):
+                    continue
+                cand = columns_list[pos]
+                marker_text = str(first_row.get(cand, "")).strip()
+                candidates.append((cand, marker_text))
+            matched = next((cand for cand, marker in candidates if marker == "예량"), None)
+            if matched is not None:
+                qty_col = matched
+            matched_out = next((cand for cand, marker in candidates if marker == "출예"), None)
+            if matched_out is not None:
+                out_col = matched_out
+        qty_cols.append(qty_col)
+        out_cols.append(out_col)
+
+    work_df = df.iloc[1:].copy() if marker_row_exists and len(df) > 1 else df.copy()
+    if work_df.empty:
+        empty = pd.Series([math.nan] * len(df), index=df.index, dtype=float)
+        return empty, empty
+
+    for col in qty_cols:
+        if col not in work_df.columns:
+            work_df[col] = ""
+    for col in out_cols:
+        if col not in work_df.columns:
+            work_df[col] = ""
+    qty_frame = work_df[qty_cols].apply(to_numeric)
+    min_series = qty_frame.min(axis=1, skipna=True)
+    out_frame = work_df[out_cols].apply(to_numeric)
+    out_sum_series = out_frame.sum(axis=1, skipna=True)
+
+    aligned = pd.Series([math.nan] * len(df), index=df.index, dtype=float)
+    aligned.loc[work_df.index] = min_series
+    aligned_out = pd.Series([math.nan] * len(df), index=df.index, dtype=float)
+    aligned_out.loc[work_df.index] = out_sum_series
+    return aligned, aligned_out
+
+
 @st.cache_resource(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
 def load_dashboard_base_data():
     perf_rows: list[dict] = []
@@ -1010,6 +1093,8 @@ def load_dashboard_base_data():
         [
             "수주번호",
             "수주건명",
+            "브랜드",
+            "브랜드명",
             "사업소",
             "확정납기",
             "단품코드",
@@ -1027,6 +1112,8 @@ def load_dashboard_base_data():
         [
             "수주번호",
             "수주건명",
+            "브랜드",
+            "브랜드명",
             "영업건명",
             "납품처주소",
             "사업소",
@@ -1041,10 +1128,7 @@ def load_dashboard_base_data():
         frames["progress"],
         ["단품코드", "색상", "계획", "생산", "잔량", "진행률", "진행상태", "관리번호"],
     )
-    inventory = select_columns_with_defaults(
-        frames["inventory"],
-        ["단품코드", "색상", "현재고", "재고금액", "기간총입고", "기간총출고"],
-    )
+    inventory = frames["inventory"].copy()
 
     order_lines["수주번호_norm"] = order_lines["수주번호"].map(normalize_order_no)
     management["수주번호_norm"] = management["수주번호"].map(normalize_order_no)
@@ -1063,6 +1147,8 @@ def load_dashboard_base_data():
         columns={
             "수주번호": "관리수주번호",
             "수주건명": "관리수주건명",
+            "브랜드": "관리브랜드",
+            "브랜드명": "관리브랜드명",
             "영업건명": "관리영업건명",
             "사업소": "관리사업소",
             "시공센터": "관리시공센터",
@@ -1092,6 +1178,13 @@ def load_dashboard_base_data():
         progress_agg = pd.DataFrame(columns=["단품코드", "색상", "계획", "생산", "잔량", "평균진행률", "진행상태", "관리번호수"])
 
     if not inventory.empty:
+        inventory = select_columns_with_defaults(
+            inventory,
+            list(inventory.columns),
+        )
+        d5_min_series, d5_out_sum_series = compute_inventory_d5_metrics(inventory)
+        inventory["예량(D+7)_num"] = d5_min_series
+        inventory["출고예정(D+7)_num"] = d5_out_sum_series
         inventory["현재고_num"] = to_numeric(inventory.get("현재고", pd.Series(dtype=object)))
         inventory["재고금액_num"] = to_numeric(inventory.get("재고금액", pd.Series(dtype=object)))
         inventory["기간총입고_num"] = to_numeric(inventory.get("기간총입고", pd.Series(dtype=object)))
@@ -1103,11 +1196,15 @@ def load_dashboard_base_data():
                 재고금액=("재고금액_num", "sum"),
                 기간총입고=("기간총입고_num", "sum"),
                 기간총출고=("기간총출고_num", "sum"),
+                예량D7=("예량(D+7)_num", "min"),
+                출고예정D7=("출고예정(D+7)_num", "sum"),
             )
             .reset_index()
         )
     else:
-        inventory_agg = pd.DataFrame(columns=["단품코드", "색상", "현재고", "재고금액", "기간총입고", "기간총출고"])
+        inventory_agg = pd.DataFrame(
+            columns=["단품코드", "색상", "현재고", "재고금액", "기간총입고", "기간총출고", "예량D7", "출고예정D7"]
+        )
 
     merged = order_lines.merge(management_subset, on="수주번호_norm", how="left")
     merged = merged.merge(progress_agg, on=["단품코드", "색상"], how="left")
@@ -1115,8 +1212,8 @@ def load_dashboard_base_data():
     merged[["계획", "생산", "잔량", "평균진행률", "관리번호수"]] = merged[
         ["계획", "생산", "잔량", "평균진행률", "관리번호수"]
     ].fillna(0)
-    merged[["현재고", "재고금액", "기간총입고", "기간총출고"]] = merged[
-        ["현재고", "재고금액", "기간총입고", "기간총출고"]
+    merged[["현재고", "재고금액", "기간총입고", "기간총출고", "예량D7", "출고예정D7"]] = merged[
+        ["현재고", "재고금액", "기간총입고", "기간총출고", "예량D7", "출고예정D7"]
     ].fillna(0)
 
     merged["대표수주건명"] = merged["관리영업건명"].replace("", pd.NA).fillna(
@@ -1131,6 +1228,13 @@ def load_dashboard_base_data():
     merged["표시프로젝트명"] = merged["상세건명"].map(lambda value: build_display_name(value, ""))
     merged["프로젝트키"] = merged["대표수주건명"].map(normalize_project_key)
     merged["통합수주건키"] = ""
+    brand_candidates = [col for col in ["브랜드", "브랜드명", "관리브랜드", "관리브랜드명"] if col in merged.columns]
+    if brand_candidates:
+        merged["브랜드표시"] = merged[brand_candidates].replace("", pd.NA).bfill(axis=1).iloc[:, 0].fillna("")
+    else:
+        merged["브랜드표시"] = ""
+    merged["관리확정납기_dt"] = pd.to_datetime(merged.get("관리확정납기", pd.Series(dtype=object)), errors="coerce")
+    merged["기준확정납기_dt"] = merged["확정납기_dt"].where(merged["확정납기_dt"].notna(), merged["관리확정납기_dt"])
 
     management_norm_col = next((col for col in management.columns if str(col).endswith("_norm")), None)
     merged_norm_col = next((col for col in merged.columns if str(col).endswith("_norm")), None)
@@ -1170,7 +1274,7 @@ def load_dashboard_base_data():
             continue
 
         clusters: list[dict] = []
-        for _, row in addr_group.sort_values(["확정납기_dt", "수주번호"]).iterrows():
+        for _, row in addr_group.sort_values(["기준확정납기_dt", "수주번호"]).iterrows():
             candidate_names = [
                 row["표시프로젝트명"],
                 row["대표프로젝트명"],
@@ -1401,7 +1505,7 @@ def load_dashboard_data(
             )
             major_items["통합수주건키"] = group_key
 
-        date_values = group["확정납기_dt"].dropna()
+        date_values = group["기준확정납기_dt"].dropna()
         if date_values.empty:
             continue
         start_date = date_values.min().date().isoformat()
@@ -1508,7 +1612,7 @@ def load_dashboard_data(
             related_source.groupby(["수주번호_norm", "수주번호"], dropna=False)
             .agg(
                 관련수주건명=("상세건명", lambda s: first_nonempty(s, representative_name)),
-                확정납기=("확정납기_dt", "max"),
+                확정납기=("기준확정납기_dt", "max"),
                 사업소=("대표사업소", lambda s: first_nonempty(s, representative_office)),
                 기준수량=("_기준수량", "sum"),
             )
@@ -1529,6 +1633,7 @@ def load_dashboard_data(
 
         detail_item_name_col = get_existing_column(group, ["단품명칭", "품목명약칭", "품목명", "품목약칭"])
         detail_standard_col = get_existing_column(group, ["표준구분", "수지구분"])
+        detail_brand_col = get_existing_column(group, ["브랜드표시", "브랜드", "브랜드명", "관리브랜드", "관리브랜드명"])
         detail_source = group.copy()
         if detail_item_name_col:
             detail_source["_품목명표시"] = detail_source[detail_item_name_col].astype(str)
@@ -1538,16 +1643,24 @@ def load_dashboard_data(
             detail_source["_표준구분표시"] = detail_source[detail_standard_col].astype(str)
         else:
             detail_source["_표준구분표시"] = ""
+        if detail_brand_col:
+            detail_source["_브랜드표시"] = detail_source[detail_brand_col].astype(str)
+        else:
+            detail_source["_브랜드표시"] = ""
         detail_items_df = (
             detail_source.groupby(["수주번호", "단품코드", "색상"], dropna=False)
             .agg(
                 관련수주건명=("상세건명", lambda s: first_nonempty(s, representative_name)),
+                브랜드=("_브랜드표시", lambda s: first_nonempty(s, "")),
                 품목명=("_품목명표시", lambda s: first_nonempty(s, "품목명 없음")),
                 제품구분=("제품구분", lambda s: first_nonempty(s, "미분류")),
                 표준구분=("_표준구분표시", lambda s: first_nonempty(s, "")),
                 수량=("수주량_num", "sum"),
                 현재고=("현재고", "max"),
-                확정납기=("확정납기_dt", "max"),
+                예량D7=("예량D7", "min"),
+                # 재고/예측 값은 수주라인 중복으로 증폭되지 않도록 대표값(max) 사용
+                출고예정D7=("출고예정D7", "max"),
+                확정납기=("기준확정납기_dt", "max"),
                 사업소=("대표사업소", lambda s: first_nonempty(s, representative_office)),
             )
             .reset_index()
@@ -1557,6 +1670,7 @@ def load_dashboard_data(
             {
                 "관련 수주번호": row["수주번호"],
                 "관련 수주건명": row["관련수주건명"],
+                "브랜드": row["브랜드"],
                 "품목명": row["품목명"],
                 "제품구분": row["제품구분"],
                 "표준구분": row["표준구분"],
@@ -1564,6 +1678,8 @@ def load_dashboard_data(
                 "색상": row["색상"],
                 "수량": int(row["수량"]),
                 "현재고": int(row["현재고"]) if pd.notna(row["현재고"]) else 0,
+                "예량(D+7)": int(row["예량D7"]) if pd.notna(row["예량D7"]) else 0,
+                "출고예정(D+7)": int(row["출고예정D7"]) if pd.notna(row["출고예정D7"]) else 0,
                 "확정납기": row["확정납기"].date().isoformat() if pd.notna(row["확정납기"]) else "",
                 "사업소": row["사업소"],
             }
@@ -2118,7 +2234,19 @@ def show_metric_detail_dialog(data: dict, filtered_orders: list[dict]):
         if "단품명칭" in display_df.columns:
             display_df["단품명칭"] = display_df["단품명칭"].map(shorten_item_name_for_display)
 
-    wanted_cols = ["대표 수주건명", "제품구분", "단품코드", "색상", "단품명칭", "수주량", "현재고", "확정납기"]
+    wanted_cols = [
+        "대표 수주건명",
+        "브랜드",
+        "제품구분",
+        "단품코드",
+        "색상",
+        "단품명칭",
+        "수주량",
+        "현재고",
+        "확정납기",
+        "예량(D+7)",
+        "출고예정(D+7)",
+    ]
     display_df = display_df[[col for col in wanted_cols if col in display_df.columns]] if not display_df.empty else display_df
 
     if not display_df.empty:
@@ -3138,12 +3266,30 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                         ]
                 df = df.rename(columns={"품목명": "단품명칭", "수량": "수주량"})
                 if effective_return_only and "현재고" in df.columns and "수주량" in df.columns:
-                    stock_series = pd.to_numeric(df["현재고"], errors="coerce").fillna(0)
-                    order_qty_series = pd.to_numeric(df["수주량"], errors="coerce").fillna(0)
-                    df = df[stock_series > order_qty_series]
+                    order_qty_series = to_numeric(df["수주량"])
+                    if "예량(D+7)" in df.columns:
+                        d7_min_forecast = to_numeric(df["예량(D+7)"])
+                        # 회수 기준: 달력일 D+7 이내의 최소 예량 - 수주량 >= 0
+                        df = df[(d7_min_forecast - order_qty_series) >= 0]
+                    else:
+                        stock_series = to_numeric(df["현재고"])
+                        # 예량 데이터가 없으면 기존 현재고 기준으로 fallback.
+                        df = (df[(stock_series - order_qty_series) >= 0])
                 if "단품명칭" in df.columns:
                     df["단품명칭"] = df["단품명칭"].map(shorten_item_name_for_display)
-                wanted_cols = ["대표 수주건명", "제품구분", "단품코드", "색상", "단품명칭", "수주량", "현재고", "확정납기"]
+                wanted_cols = [
+                    "대표 수주건명",
+                    "브랜드",
+                    "제품구분",
+                    "단품코드",
+                    "색상",
+                    "단품명칭",
+                    "수주량",
+                    "현재고",
+                    "확정납기",
+                    "예량(D+7)",
+                    "출고예정(D+7)",
+                ]
                 return df[[col for col in wanted_cols if col in df.columns]]
 
             merged_item_rows = []

@@ -3,6 +3,7 @@ import io
 import json
 import os
 import math
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
 from functools import lru_cache
@@ -773,6 +774,14 @@ def name_similarity(a, b) -> float:
     return inter / union if union else 0.0
 
 
+def token_jaccard(a_tokens: set[str], b_tokens: set[str]) -> float:
+    if not a_tokens or not b_tokens:
+        return 0.0
+    inter = len(a_tokens & b_tokens)
+    union = len(a_tokens | b_tokens)
+    return inter / union if union else 0.0
+
+
 def to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
 
@@ -1060,7 +1069,7 @@ def compute_inventory_d5_metrics(df: pd.DataFrame) -> tuple[pd.Series, pd.Series
     return aligned, aligned_out
 
 
-@st.cache_resource(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
+@st.cache_resource(ttl=1800, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
 def load_dashboard_base_data():
     perf_rows: list[dict] = []
     step_start = perf_counter()
@@ -1071,6 +1080,7 @@ def load_dashboard_base_data():
 
     latest_titles: dict[str, str] = {}
     frames: dict[str, pd.DataFrame] = {}
+    latest_ws_map: dict[str, object] = {}
     for key, prefix in WORKSHEET_PREFIXES.items():
         matches = [ws for ws in worksheets if ws.title.startswith(prefix)]
         if not matches:
@@ -1085,7 +1095,14 @@ def load_dashboard_base_data():
             raise ValueError(f"'{prefix}'로 시작하는 시트를 찾지 못했습니다.")
         latest = sorted(matches, key=lambda ws: ws.title)[-1]
         latest_titles[key] = latest.title
-        frames[key] = normalize_dataframe_columns(worksheet_to_df(latest))
+        latest_ws_map[key] = latest
+    if latest_ws_map:
+        max_workers = min(4, len(latest_ws_map))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(worksheet_to_df, ws): key for key, ws in latest_ws_map.items()}
+            for future in as_completed(futures):
+                key = futures[future]
+                frames[key] = normalize_dataframe_columns(future.result())
     step_start = record_perf_step(perf_rows, "worksheet_select_and_to_dataframe", step_start)
 
     order_lines = select_columns_with_defaults(
@@ -1163,7 +1180,7 @@ def load_dashboard_base_data():
         progress["잔량_num"] = to_numeric(progress.get("잔량", pd.Series(dtype=object)))
         progress["진행률_num"] = to_numeric(progress.get("진행률", pd.Series(dtype=object)))
         progress_agg = (
-            progress.groupby(["단품코드", "색상"], dropna=False)
+            progress.groupby(["단품코드", "색상"], dropna=False, sort=False)
             .agg(
                 계획=("계획_num", "sum"),
                 생산=("생산_num", "sum"),
@@ -1190,7 +1207,7 @@ def load_dashboard_base_data():
         inventory["기간총입고_num"] = to_numeric(inventory.get("기간총입고", pd.Series(dtype=object)))
         inventory["기간총출고_num"] = to_numeric(inventory.get("기간총출고", pd.Series(dtype=object)))
         inventory_agg = (
-            inventory.groupby(["단품코드", "색상"], dropna=False)
+            inventory.groupby(["단품코드", "색상"], dropna=False, sort=False)
             .agg(
                 현재고=("현재고_num", "sum"),
                 재고금액=("재고금액_num", "sum"),
@@ -1223,11 +1240,37 @@ def load_dashboard_base_data():
     merged["대표주소"] = merged["납품처주소"].replace("", pd.NA).fillna("주소 미등록")
     merged["기본주소"] = merged["대표주소"].map(normalize_address).replace("", "주소 미등록")
     merged["대표사업소"] = merged["관리사업소"].replace("", pd.NA).fillna(merged["사업소"])
-    merged["구분"] = merged["대표사업소"].apply(lambda value: "수출" if "수출" in str(value).strip() else "내수")
+    representative_office_text = merged["대표사업소"].astype(str)
+    merged["구분"] = "내수"
+    merged.loc[representative_office_text.str.contains("수출", na=False), "구분"] = "수출"
     merged["대표프로젝트명"] = merged["대표수주건명"].map(simplify_project_name)
     merged["표시프로젝트명"] = merged["상세건명"].map(lambda value: build_display_name(value, ""))
     merged["프로젝트키"] = merged["대표수주건명"].map(normalize_project_key)
     merged["통합수주건키"] = ""
+    merged["_cluster_name"] = (
+        merged[["표시프로젝트명", "대표프로젝트명", "상세건명", "대표수주건명", "수주번호_norm"]]
+        .replace("", pd.NA)
+        .bfill(axis=1)
+        .iloc[:, 0]
+        .fillna("")
+    )
+    merged["_cluster_display"] = [
+        build_display_name(name, fallback)
+        for name, fallback in zip(
+            merged["_cluster_name"].astype(str),
+            merged["수주번호_norm"].astype(str),
+        )
+    ]
+    merged["_cluster_project_key"] = merged["_cluster_display"].map(normalize_project_key)
+    merged["_cluster_name_tokens"] = [set(extract_name_tokens(v)) for v in merged["_cluster_name"].astype(str)]
+    merged["_cluster_display_tokens"] = [set(extract_name_tokens(v)) for v in merged["_cluster_display"].astype(str)]
+    merged["_cluster_tokens"] = [
+        name_tokens | display_tokens
+        for name_tokens, display_tokens in zip(
+            merged["_cluster_name_tokens"],
+            merged["_cluster_display_tokens"],
+        )
+    ]
     brand_candidates = [col for col in ["브랜드", "브랜드명", "관리브랜드", "관리브랜드명"] if col in merged.columns]
     if brand_candidates:
         merged["브랜드표시"] = merged[brand_candidates].replace("", pd.NA).bfill(axis=1).iloc[:, 0].fillna("")
@@ -1272,52 +1315,188 @@ def load_dashboard_base_data():
         if not base_address or base_address == "주소 미등록":
             merged.loc[addr_group.index, "통합수주건키"] = addr_group["수주번호_norm"]
             continue
+        if len(addr_group) == 1:
+            merged.loc[addr_group.index, "통합수주건키"] = f"{base_address}||01"
+            continue
 
-        clusters: list[dict] = []
-        for _, row in addr_group.sort_values(["기준확정납기_dt", "수주번호"]).iterrows():
-            candidate_names = [
-                row["표시프로젝트명"],
-                row["대표프로젝트명"],
-                row["상세건명"],
-                row["대표수주건명"],
-            ]
-            candidate_name = first_nonempty_values(candidate_names, row["수주번호_norm"])
-            candidate_display = build_display_name(candidate_name, row["수주번호_norm"])
-            candidate_tokens = set(extract_name_tokens(candidate_name)) | set(extract_name_tokens(candidate_display))
-
-            matched_cluster = None
-            best_score = 0.0
-            for cluster in clusters:
-                cluster_tokens = cluster.get("tokens", set())
-                if candidate_tokens and cluster_tokens and candidate_tokens.isdisjoint(cluster_tokens):
-                    continue
-                score = max(
-                    name_similarity(candidate_name, cluster["name"]),
-                    name_similarity(candidate_display, cluster["display"]),
-                )
-                if score > best_score:
-                    best_score = score
-                    matched_cluster = cluster
-
-            if matched_cluster and best_score >= 0.35:
-                matched_cluster["indices"].append(row.name)
-                matched_cluster["tokens"] = set(matched_cluster.get("tokens", set())) | candidate_tokens
-                if len(candidate_display) < len(matched_cluster["display"]) and candidate_display:
-                    matched_cluster["display"] = candidate_display
-                continue
-
-            clusters.append(
+        sorted_group = addr_group.sort_values(["기준확정납기_dt", "수주번호"])
+        row_infos: list[dict] = []
+        idx_values = sorted_group.index.tolist()
+        fallback_values = sorted_group["수주번호_norm"].fillna("").astype(str).tolist()
+        name_values = sorted_group["_cluster_name"].fillna("").astype(str).tolist()
+        display_values = sorted_group["_cluster_display"].fillna("").astype(str).tolist()
+        name_token_values = sorted_group["_cluster_name_tokens"].tolist()
+        display_token_values = sorted_group["_cluster_display_tokens"].tolist()
+        token_values = sorted_group["_cluster_tokens"].tolist()
+        project_key_values = sorted_group["_cluster_project_key"].fillna("").astype(str).tolist()
+        for idx, fallback_no, raw_name, raw_display, raw_name_tokens, raw_display_tokens, raw_tokens, raw_project_key in zip(
+            idx_values,
+            fallback_values,
+            name_values,
+            display_values,
+            name_token_values,
+            display_token_values,
+            token_values,
+            project_key_values,
+        ):
+            candidate_name = raw_name or fallback_no
+            candidate_display = raw_display or fallback_no
+            candidate_name_tokens = raw_name_tokens if isinstance(raw_name_tokens, set) else set()
+            candidate_display_tokens = raw_display_tokens if isinstance(raw_display_tokens, set) else set()
+            candidate_tokens = raw_tokens if isinstance(raw_tokens, set) else set()
+            candidate_project_key = raw_project_key or ""
+            row_infos.append(
                 {
-                    "indices": [row.name],
+                    "idx": idx,
                     "name": candidate_name,
-                    "display": candidate_display or row["수주번호_norm"],
+                    "display": candidate_display,
+                    "name_tokens": candidate_name_tokens,
+                    "display_tokens": candidate_display_tokens,
                     "tokens": candidate_tokens,
+                    "project_key": candidate_project_key,
                 }
             )
 
+        clusters: list[dict] = []
+        clusters_by_project_key: dict[str, dict] = {}
+        unresolved_rows: list[dict] = []
+
+        for info in row_infos:
+            project_key = info["project_key"]
+            if not project_key:
+                unresolved_rows.append(info)
+                continue
+            cluster = clusters_by_project_key.get(project_key)
+            if cluster is None:
+                cluster = {
+                    "indices": [info["idx"]],
+                    "name": info["name"],
+                    "display": info["display"],
+                    "name_tokens": set(info["name_tokens"]),
+                    "display_tokens": set(info["display_tokens"]),
+                    "tokens": set(info["tokens"]),
+                }
+                clusters.append(cluster)
+                clusters_by_project_key[project_key] = cluster
+            else:
+                cluster["indices"].append(info["idx"])
+                cluster["tokens"] = set(cluster.get("tokens", set())) | info["tokens"]
+
+        unresolved_by_display: dict[str, dict] = {}
+        still_unresolved_rows: list[dict] = []
+        for info in unresolved_rows:
+            display_key = normalize_project_key(info["display"])
+            if not display_key:
+                still_unresolved_rows.append(info)
+                continue
+            cluster = unresolved_by_display.get(display_key)
+            if cluster is None:
+                cluster = {
+                    "indices": [info["idx"]],
+                    "name": info["name"],
+                    "display": info["display"],
+                    "name_tokens": set(info["name_tokens"]),
+                    "display_tokens": set(info["display_tokens"]),
+                    "tokens": set(info["tokens"]),
+                }
+                clusters.append(cluster)
+                unresolved_by_display[display_key] = cluster
+            else:
+                cluster["indices"].append(info["idx"])
+                cluster["tokens"] = set(cluster.get("tokens", set())) | info["tokens"]
+                cluster["name_tokens"] = set(cluster.get("name_tokens", set())) | set(info["name_tokens"])
+                cluster["display_tokens"] = set(cluster.get("display_tokens", set())) | set(info["display_tokens"])
+
+        # Large unresolved groups are expensive with pairwise-like matching.
+        # Use a fast token-signature clustering path for bulk cases.
+        if len(still_unresolved_rows) > 250:
+            token_signature_clusters: dict[str, dict] = {}
+            for info in still_unresolved_rows:
+                tokens_sorted = sorted(info["tokens"])
+                if tokens_sorted:
+                    signature = "|".join(tokens_sorted[:2])
+                else:
+                    # Keep truly tokenless rows separate to avoid false merges.
+                    signature = f"__solo__{info['idx']}"
+                cluster = token_signature_clusters.get(signature)
+                if cluster is None:
+                    cluster = {
+                        "indices": [info["idx"]],
+                        "name": info["name"],
+                        "display": info["display"],
+                        "name_tokens": set(info["name_tokens"]),
+                        "display_tokens": set(info["display_tokens"]),
+                        "tokens": set(info["tokens"]),
+                    }
+                    clusters.append(cluster)
+                    token_signature_clusters[signature] = cluster
+                else:
+                    cluster["indices"].append(info["idx"])
+                    cluster["tokens"] = set(cluster.get("tokens", set())) | info["tokens"]
+                    cluster["name_tokens"] = set(cluster.get("name_tokens", set())) | set(info["name_tokens"])
+                    cluster["display_tokens"] = set(cluster.get("display_tokens", set())) | set(info["display_tokens"])
+        else:
+            token_to_cluster_indices: dict[str, set[int]] = {}
+            for cluster_idx, cluster in enumerate(clusters):
+                for token in cluster.get("tokens", set()):
+                    token_to_cluster_indices.setdefault(token, set()).add(cluster_idx)
+
+            for info in still_unresolved_rows:
+                matched_cluster = None
+                matched_cluster_idx = -1
+                best_score = 0.0
+                candidate_cluster_indices: set[int] = set()
+                for token in info["tokens"]:
+                    candidate_cluster_indices.update(token_to_cluster_indices.get(token, set()))
+
+                for cluster_idx in candidate_cluster_indices:
+                    cluster = clusters[cluster_idx]
+                    score = max(
+                        token_jaccard(info["name_tokens"], cluster.get("name_tokens", set())),
+                        token_jaccard(info["display_tokens"], cluster.get("display_tokens", set())),
+                    )
+                    if score > best_score:
+                        best_score = score
+                        matched_cluster = cluster
+                        matched_cluster_idx = cluster_idx
+
+                if matched_cluster and best_score >= 0.35:
+                    prev_tokens = set(matched_cluster.get("tokens", set()))
+                    matched_cluster["indices"].append(info["idx"])
+                    merged_tokens = prev_tokens | set(info["tokens"])
+                    matched_cluster["tokens"] = merged_tokens
+                    matched_cluster["name_tokens"] = set(matched_cluster.get("name_tokens", set())) | set(info["name_tokens"])
+                    matched_cluster["display_tokens"] = set(matched_cluster.get("display_tokens", set())) | set(
+                        info["display_tokens"]
+                    )
+                    if len(info["display"]) < len(matched_cluster["display"]) and info["display"]:
+                        matched_cluster["display"] = info["display"]
+                    for token in (merged_tokens - prev_tokens):
+                        token_to_cluster_indices.setdefault(token, set()).add(matched_cluster_idx)
+                    continue
+
+                new_cluster = {
+                    "indices": [info["idx"]],
+                    "name": info["name"],
+                    "display": info["display"],
+                    "name_tokens": set(info["name_tokens"]),
+                    "display_tokens": set(info["display_tokens"]),
+                    "tokens": set(info["tokens"]),
+                }
+                clusters.append(new_cluster)
+                new_cluster_idx = len(clusters) - 1
+                for token in new_cluster["tokens"]:
+                    token_to_cluster_indices.setdefault(token, set()).add(new_cluster_idx)
+
+        assign_idx: list[int] = []
+        assign_vals: list[str] = []
         for cluster_idx, cluster in enumerate(clusters, start=1):
             cluster_key = f"{base_address}||{cluster_idx:02d}"
-            merged.loc[cluster["indices"], "통합수주건키"] = cluster_key
+            indices = cluster.get("indices", [])
+            assign_idx.extend(indices)
+            assign_vals.extend([cluster_key] * len(indices))
+        if assign_idx:
+            merged.loc[assign_idx, "통합수주건키"] = assign_vals
     step_start = record_perf_step(perf_rows, "address_cluster_grouping", step_start)
 
     return {
@@ -1329,7 +1508,7 @@ def load_dashboard_base_data():
     }
 
 
-@st.cache_data(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
+@st.cache_data(ttl=1800, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
 def load_dashboard_data(
     etc_amount_threshold: int = 100_000_000,
     product_family: str = "\ucda9\uc8fc",
@@ -1342,7 +1521,9 @@ def load_dashboard_data(
     latest_titles = base_data["source_titles"]
     na_keyword_rows = base_data["north_america_keyword_rows"]
     na_active_keywords = base_data["north_america_active_keywords"]
-    merged = base_data["merged"].copy()
+    # Reuse cached base frame directly to avoid per-rerun full copy cost.
+    # This stage only reads from merged (no in-place mutation needed).
+    merged = base_data["merged"]
     perf_rows.extend(base_data.get("perf_base_ms", []))
 
     is_target_product = merged["제품구분"].isin(["충주1제품", "충주2제품", "충주상품", "충주2상품", "F우레탄제품"])
@@ -1350,11 +1531,10 @@ def load_dashboard_data(
         is_target_product = merged["제품구분"].astype(str).str.contains("\uc548\uc131", na=False)
     is_non_stock = merged["재고구분"].astype(str).str.strip() == "비재고"
     is_custom = merged["표준구분"].astype(str).str.contains("주문품", na=False)
-    merged["주요후보"] = is_target_product & is_non_stock & is_custom
-
-    candidate = merged[merged["주요후보"]].copy()
+    major_candidate_mask = is_target_product & is_non_stock & is_custom
+    candidate = merged[major_candidate_mask].copy()
     candidate_item_agg = (
-        candidate.groupby(["통합수주건키", "단품코드", "색상"], dropna=False)
+        candidate.groupby(["통합수주건키", "단품코드", "색상"], dropna=False, sort=False)
         .agg(
             수량=("수주량_num", "sum"),
             품목명=("단품명칭", lambda s: first_nonempty(s, "품목명 없음")),
@@ -1384,7 +1564,7 @@ def load_dashboard_data(
     ].copy()
     if not order_amount_candidate.empty:
         order_amount_agg = (
-            order_amount_candidate.groupby("통합수주건키", dropna=False)
+            order_amount_candidate.groupby("통합수주건키", dropna=False, sort=False)
             .agg(주문품수주금액합계=("수주금액_num", "sum"))
             .reset_index()
         )
@@ -1400,7 +1580,7 @@ def load_dashboard_data(
     etc_amount_candidate = merged[is_target_product].copy()
     if not etc_amount_candidate.empty:
         etc_amount_agg = (
-            etc_amount_candidate.groupby("통합수주건키", dropna=False)
+            etc_amount_candidate.groupby("통합수주건키", dropna=False, sort=False)
             .agg(충주계열수주금액합계=("수주금액_num", "sum"))
             .reset_index()
         )
@@ -1467,17 +1647,32 @@ def load_dashboard_data(
     grouped_orders = merged[merged["통합수주건키"].isin(major_group_keys | etc_group_keys)].copy()
     step_start = record_perf_step(perf_rows, "major_etc_export_filtering", step_start)
 
+    major_items_by_group_key: dict[str, pd.DataFrame] = {
+        str(group_key): df for group_key, df in major_item_agg.groupby("통합수주건키", dropna=False, sort=False)
+    }
+
+    item_name_col_global = get_existing_column(grouped_orders, ["단품명칭", "품목명약칭", "품목명", "품목약칭"])
+    product_class_col_global = get_existing_column(grouped_orders, ["제품구분"])
+    status_col_global = get_existing_column(grouped_orders, ["진행상태"])
+    detail_item_name_col_global = get_existing_column(grouped_orders, ["단품명칭", "품목명약칭", "품목명", "품목약칭"])
+    detail_standard_col_global = get_existing_column(grouped_orders, ["표준구분", "수지구분"])
+    detail_brand_col_global = get_existing_column(grouped_orders, ["브랜드표시", "브랜드", "브랜드명", "관리브랜드", "관리브랜드명"])
+
     order_records: list[dict] = []
     items_by_order: dict[str, list[dict]] = {}
     related_by_order: dict[str, list[dict]] = {}
     detail_items_by_order: dict[str, list[dict]] = {}
 
-    for group_key, group in grouped_orders.groupby("통합수주건키", dropna=False):
-        major_items = major_item_agg[major_item_agg["통합수주건키"] == group_key].copy()
+    for group_key, group in grouped_orders.groupby("통합수주건키", dropna=False, sort=False):
+        major_items = major_items_by_group_key.get(str(group_key))
+        if major_items is None:
+            major_items = pd.DataFrame()
+        else:
+            major_items = major_items.copy()
         if major_items.empty:
-            item_name_col = get_existing_column(group, ["단품명칭", "품목명약칭", "품목명", "품목약칭"])
-            product_class_col = get_existing_column(group, ["제품구분"])
-            status_col = get_existing_column(group, ["진행상태"])
+            item_name_col = item_name_col_global
+            product_class_col = product_class_col_global
+            status_col = status_col_global
             fallback_group = group.copy()
             fallback_group["_item_name_fallback"] = (
                 fallback_group[item_name_col].astype(str) if item_name_col else "품목명 없음"
@@ -1489,7 +1684,7 @@ def load_dashboard_data(
                 fallback_group[status_col].astype(str) if status_col else "미확인"
             )
             major_items = (
-                fallback_group.groupby(["단품코드", "색상"], dropna=False)
+                fallback_group.groupby(["단품코드", "색상"], dropna=False, sort=False)
                 .agg(
                     수량=("수주량_num", "sum"),
                     품목명=("_item_name_fallback", lambda s: first_nonempty(s, "품목명 없음")),
@@ -1526,7 +1721,8 @@ def load_dashboard_data(
         else:
             risk = "낮음"
 
-        top_item = major_items.sort_values(["수량", "생산"], ascending=[False, False]).iloc[0]
+        major_items_sorted = major_items.sort_values(["수량", "생산"], ascending=[False, False])
+        top_item = major_items_sorted.iloc[0]
         representative_name = first_nonempty(group["대표프로젝트명"], first_nonempty(group["대표수주건명"], group_key))
         representative_title = first_nonempty(group["상세건명"], representative_name)
         display_name = build_display_name(representative_title, representative_name)
@@ -1600,7 +1796,7 @@ def load_dashboard_data(
                 "stockAmount": int(row["재고금액"]),
                 "status": row["진행상태"],
             }
-            for _, row in major_items.sort_values(["수량", "생산"], ascending=[False, False]).iterrows()
+            for _, row in major_items_sorted.iterrows()
         ]
 
         related_source = group.copy()
@@ -1609,7 +1805,7 @@ def load_dashboard_data(
             0,
         )
         related_rows_df = (
-            related_source.groupby(["수주번호_norm", "수주번호"], dropna=False)
+            related_source.groupby(["수주번호_norm", "수주번호"], dropna=False, sort=False)
             .agg(
                 관련수주건명=("상세건명", lambda s: first_nonempty(s, representative_name)),
                 확정납기=("기준확정납기_dt", "max"),
@@ -1631,9 +1827,9 @@ def load_dashboard_data(
             for _, row in related_rows_df.iterrows()
         ]
 
-        detail_item_name_col = get_existing_column(group, ["단품명칭", "품목명약칭", "품목명", "품목약칭"])
-        detail_standard_col = get_existing_column(group, ["표준구분", "수지구분"])
-        detail_brand_col = get_existing_column(group, ["브랜드표시", "브랜드", "브랜드명", "관리브랜드", "관리브랜드명"])
+        detail_item_name_col = detail_item_name_col_global
+        detail_standard_col = detail_standard_col_global
+        detail_brand_col = detail_brand_col_global
         detail_source = group.copy()
         if detail_item_name_col:
             detail_source["_품목명표시"] = detail_source[detail_item_name_col].astype(str)
@@ -1648,7 +1844,7 @@ def load_dashboard_data(
         else:
             detail_source["_브랜드표시"] = ""
         detail_items_df = (
-            detail_source.groupby(["수주번호", "단품코드", "색상"], dropna=False)
+            detail_source.groupby(["수주번호", "단품코드", "색상"], dropna=False, sort=False)
             .agg(
                 관련수주건명=("상세건명", lambda s: first_nonempty(s, representative_name)),
                 브랜드=("_브랜드표시", lambda s: first_nonempty(s, "")),
@@ -3507,29 +3703,29 @@ def render_metrics(all_orders: list[dict]):
     st.session_state["monthly_order_ids"] = [order["id"] for order in monthly_orders]
     st.session_state["due_soon_order_ids"] = [order["id"] for order in due_soon_orders]
 
-    weekly_export = sum(1 for order in weekly_orders if order["type"] == "수출")
-    weekly_domestic = sum(1 for order in weekly_orders if order["type"] == "내수")
-    monthly_export = sum(1 for order in monthly_orders if order["type"] == "수출")
-    monthly_domestic = sum(1 for order in monthly_orders if order["type"] == "내수")
+    def summary_partial_text(orders: list[dict]) -> str:
+        item_count = sum(int(order.get("items", 0) or 0) for order in orders)
+        box_count = sum(int(order.get("amount", 0) or 0) for order in orders)
+        return f"{item_count:,}품목 / {box_count:,}박스"
 
     cards = [
         {
             "key": "weekly",
             "subtitle": f"{str(year)[-2:]}년 {month}월 {week_no}주 주요 수주건",
             "total": f"{len(weekly_orders):,}",
-            "partial": f"수출 {weekly_export:,}건 / 내수 {weekly_domestic:,}건",
+            "partial": summary_partial_text(weekly_orders),
         },
         {
             "key": "monthly",
             "subtitle": f"{str(year)[-2:]}년 {month}월 주요 수주건",
             "total": f"{len(monthly_orders):,}",
-            "partial": f"수출 {monthly_export:,}건 / 내수 {monthly_domestic:,}건",
+            "partial": summary_partial_text(monthly_orders),
         },
         {
             "key": "due_soon",
             "subtitle": "납기 임박건 (D-3)",
             "total": f"{len(due_soon_orders):,}",
-            "partial": f"기준: {due_soon_start.month}/{due_soon_start.day}~{due_soon_end.month}/{due_soon_end.day}",
+            "partial": summary_partial_text(due_soon_orders),
         },
     ]
 
@@ -3573,3 +3769,4 @@ def render_metrics(all_orders: list[dict]):
 
 if __name__ == "__main__":
     main()
+

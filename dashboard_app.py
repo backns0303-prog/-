@@ -5,8 +5,10 @@ import os
 import math
 from collections.abc import Mapping
 from datetime import date, datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 import re
+from time import perf_counter
 from zoneinfo import ZoneInfo
 
 import gspread
@@ -31,6 +33,8 @@ summary_cards_component = components.declare_component(
     "summary_cards_component",
     path=str(SUMMARY_COMPONENT_DIR),
 )
+
+SHOW_PERF_LOG_PANEL = False
 
 GOOGLE_CREDENTIALS_FILE = Path(__file__).parent / "streamlit-sheets-upload-34b193fd0a59.json"
 GOOGLE_SPREADSHEET_ID = "1Jy1DFHveJYFEw2lVg_pUGeE7HCcFmYaeUb6FwSrZGJM"
@@ -522,6 +526,14 @@ def first_nonempty(series: pd.Series, fallback: str = "") -> str:
     return fallback
 
 
+def first_nonempty_values(values, fallback: str = "") -> str:
+    for value in values:
+        text = str(value).strip()
+        if text and text.lower() != "nan":
+            return text
+    return fallback
+
+
 def normalize_order_no(value) -> str:
     if value is None:
         return ""
@@ -705,10 +717,28 @@ def build_display_name(title, fallback: str = "") -> str:
     return text or fallback_text
 
 
-def extract_name_tokens(value) -> set[str]:
+def compile_keyword_regex(keywords: list[str]) -> str:
+    normalized_keywords = []
+    for kw in keywords:
+        normalized_kw = normalize_match_text(kw)
+        if normalized_kw:
+            normalized_keywords.append(re.escape(normalized_kw))
+    if not normalized_keywords:
+        return ""
+    return "|".join(sorted(set(normalized_keywords), key=len, reverse=True))
+
+
+def record_perf_step(perf_rows: list[dict], step: str, start_time: float) -> float:
+    now = perf_counter()
+    perf_rows.append({"step": step, "ms": round((now - start_time) * 1000, 1)})
+    return now
+
+
+@lru_cache(maxsize=50000)
+def extract_name_tokens(value: str) -> frozenset[str]:
     text = build_display_name(value, "")
     if not text:
-        return set()
+        return frozenset()
     raw_tokens = re.split(r"[\s\-_()/]+", text)
     stopwords = {
         "주",
@@ -722,7 +752,7 @@ def extract_name_tokens(value) -> set[str]:
         "사무비품",
         "비규격",
     }
-    tokens = set()
+    tokens: set[str] = set()
     for token in raw_tokens:
         token = token.strip()
         if len(token) < 2:
@@ -730,7 +760,7 @@ def extract_name_tokens(value) -> set[str]:
         if token in stopwords:
             continue
         tokens.add(token.upper())
-    return tokens
+    return frozenset(tokens)
 
 
 def name_similarity(a, b) -> float:
@@ -747,6 +777,7 @@ def to_numeric(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series.astype(str).str.replace(",", "", regex=False), errors="coerce").fillna(0)
 
 
+@st.cache_resource(show_spinner=False)
 def open_spreadsheet():
     creds = None
 
@@ -941,15 +972,19 @@ def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.rename(columns=renamed)
 
 
-@st.cache_data(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
-def load_dashboard_data(
-    etc_amount_threshold: int = 100_000_000,
-    product_family: str = "\ucda9\uc8fc",
-    export_only_nonstock_custom: bool = True,
-):
+def select_columns_with_defaults(df: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    selected = df.reindex(columns=columns).copy()
+    return selected.fillna("")
+
+
+@st.cache_resource(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
+def load_dashboard_base_data():
+    perf_rows: list[dict] = []
+    step_start = perf_counter()
     spreadsheet = open_spreadsheet()
     worksheets = spreadsheet.worksheets()
     na_keyword_rows, na_active_keywords = load_north_america_keywords(spreadsheet)
+    step_start = record_perf_step(perf_rows, "sheet_open_and_keyword_load", step_start)
 
     latest_titles: dict[str, str] = {}
     frames: dict[str, pd.DataFrame] = {}
@@ -968,11 +1003,48 @@ def load_dashboard_data(
         latest = sorted(matches, key=lambda ws: ws.title)[-1]
         latest_titles[key] = latest.title
         frames[key] = normalize_dataframe_columns(worksheet_to_df(latest))
+    step_start = record_perf_step(perf_rows, "worksheet_select_and_to_dataframe", step_start)
 
-    order_lines = frames["order_lines"].copy()
-    management = frames["management"].copy()
-    progress = frames["progress"].copy()
-    inventory = frames["inventory"].copy()
+    order_lines = select_columns_with_defaults(
+        frames["order_lines"],
+        [
+            "수주번호",
+            "수주건명",
+            "사업소",
+            "확정납기",
+            "단품코드",
+            "색상",
+            "수주량",
+            "수주금액",
+            "제품구분",
+            "재고구분",
+            "표준구분",
+            "단품명칭",
+        ],
+    )
+    management = select_columns_with_defaults(
+        frames["management"],
+        [
+            "수주번호",
+            "수주건명",
+            "영업건명",
+            "납품처주소",
+            "사업소",
+            "시공센터",
+            "시공유무",
+            "확정납기",
+            "대리점",
+            "실적대리점",
+        ],
+    )
+    progress = select_columns_with_defaults(
+        frames["progress"],
+        ["단품코드", "색상", "계획", "생산", "잔량", "진행률", "진행상태", "관리번호"],
+    )
+    inventory = select_columns_with_defaults(
+        frames["inventory"],
+        ["단품코드", "색상", "현재고", "재고금액", "기간총입고", "기간총출고"],
+    )
 
     order_lines["수주번호_norm"] = order_lines["수주번호"].map(normalize_order_no)
     management["수주번호_norm"] = management["수주번호"].map(normalize_order_no)
@@ -986,23 +1058,7 @@ def load_dashboard_data(
         + order_lines["색상"].astype(str).fillna("")
     )
 
-    management_subset = (
-        management[
-            [
-                "수주번호_norm",
-                "수주번호",
-                "수주건명",
-                "영업건명",
-                "납품처주소",
-                "사업소",
-                "시공센터",
-                "시공유무",
-                "확정납기",
-            ]
-        ]
-        .drop_duplicates(subset=["수주번호_norm"], keep="first")
-        .copy()
-    )
+    management_subset = management.drop_duplicates(subset=["수주번호_norm"], keep="first").copy()
     management_subset = management_subset.rename(
         columns={
             "수주번호": "관리수주번호",
@@ -1078,8 +1134,8 @@ def load_dashboard_data(
 
     management_norm_col = next((col for col in management.columns if str(col).endswith("_norm")), None)
     merged_norm_col = next((col for col in merged.columns if str(col).endswith("_norm")), None)
-    dealer_col = get_existing_column(management, ["\ub300\ub9ac\uc810"])
-    perf_dealer_col = get_existing_column(management, ["\uc2e4\uc801\ub300\ub9ac\uc810"])
+    dealer_col = get_existing_column(management, ["대리점"])
+    perf_dealer_col = get_existing_column(management, ["실적대리점"])
     if management_norm_col and merged_norm_col and (dealer_col or perf_dealer_col):
         map_cols = [management_norm_col]
         if dealer_col:
@@ -1104,6 +1160,7 @@ def load_dashboard_data(
         merged["_na_dealer"] = ""
     if "_na_perf_dealer" not in merged.columns:
         merged["_na_perf_dealer"] = ""
+    step_start = record_perf_step(perf_rows, "base_merge_and_enrichment", step_start)
 
     # Address first: create candidate groups by normalized site, then split them
     # by project-name similarity so unrelated jobs at the same site stay separate.
@@ -1120,12 +1177,16 @@ def load_dashboard_data(
                 row["상세건명"],
                 row["대표수주건명"],
             ]
-            candidate_name = first_nonempty(pd.Series(candidate_names), row["수주번호_norm"])
+            candidate_name = first_nonempty_values(candidate_names, row["수주번호_norm"])
             candidate_display = build_display_name(candidate_name, row["수주번호_norm"])
+            candidate_tokens = set(extract_name_tokens(candidate_name)) | set(extract_name_tokens(candidate_display))
 
             matched_cluster = None
             best_score = 0.0
             for cluster in clusters:
+                cluster_tokens = cluster.get("tokens", set())
+                if candidate_tokens and cluster_tokens and candidate_tokens.isdisjoint(cluster_tokens):
+                    continue
                 score = max(
                     name_similarity(candidate_name, cluster["name"]),
                     name_similarity(candidate_display, cluster["display"]),
@@ -1136,6 +1197,7 @@ def load_dashboard_data(
 
             if matched_cluster and best_score >= 0.35:
                 matched_cluster["indices"].append(row.name)
+                matched_cluster["tokens"] = set(matched_cluster.get("tokens", set())) | candidate_tokens
                 if len(candidate_display) < len(matched_cluster["display"]) and candidate_display:
                     matched_cluster["display"] = candidate_display
                 continue
@@ -1145,12 +1207,39 @@ def load_dashboard_data(
                     "indices": [row.name],
                     "name": candidate_name,
                     "display": candidate_display or row["수주번호_norm"],
+                    "tokens": candidate_tokens,
                 }
             )
 
         for cluster_idx, cluster in enumerate(clusters, start=1):
             cluster_key = f"{base_address}||{cluster_idx:02d}"
             merged.loc[cluster["indices"], "통합수주건키"] = cluster_key
+    step_start = record_perf_step(perf_rows, "address_cluster_grouping", step_start)
+
+    return {
+        "merged": merged,
+        "source_titles": latest_titles,
+        "north_america_keyword_rows": na_keyword_rows,
+        "north_america_active_keywords": na_active_keywords,
+        "perf_base_ms": perf_rows,
+    }
+
+
+@st.cache_data(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
+def load_dashboard_data(
+    etc_amount_threshold: int = 100_000_000,
+    product_family: str = "\ucda9\uc8fc",
+    export_only_nonstock_custom: bool = True,
+):
+    perf_rows: list[dict] = []
+    step_start = perf_counter()
+    base_data = load_dashboard_base_data()
+    step_start = record_perf_step(perf_rows, "base_data_fetch", step_start)
+    latest_titles = base_data["source_titles"]
+    na_keyword_rows = base_data["north_america_keyword_rows"]
+    na_active_keywords = base_data["north_america_active_keywords"]
+    merged = base_data["merged"].copy()
+    perf_rows.extend(base_data.get("perf_base_ms", []))
 
     is_target_product = merged["제품구분"].isin(["충주1제품", "충주2제품", "충주상품", "충주2상품", "F우레탄제품"])
     if product_family == "\uc548\uc131":
@@ -1262,13 +1351,17 @@ def load_dashboard_data(
             + " "
             + merged.get("_na_perf_dealer", pd.Series("", index=merged.index)).astype(str)
         )
-        north_america_keyword_mask = dealer_text.apply(
-            lambda value: bool(find_matching_keywords(value, na_active_keywords))
-        )
+        keyword_pattern = compile_keyword_regex(na_active_keywords)
+        if keyword_pattern:
+            normalized_dealer_text = dealer_text.map(normalize_match_text)
+            north_america_keyword_mask = normalized_dealer_text.str.contains(keyword_pattern, regex=True, na=False)
+        else:
+            north_america_keyword_mask = pd.Series(False, index=merged.index)
         north_america_target_mask = export_mask & north_america_product_mask & north_america_keyword_mask
         north_america_group_keys = set(merged.loc[north_america_target_mask, "통합수주건키"].astype(str).unique())
         major_group_keys.update(north_america_group_keys)
     grouped_orders = merged[merged["통합수주건키"].isin(major_group_keys | etc_group_keys)].copy()
+    step_start = record_perf_step(perf_rows, "major_etc_export_filtering", step_start)
 
     order_records: list[dict] = []
     items_by_order: dict[str, list[dict]] = {}
@@ -1476,6 +1569,7 @@ def load_dashboard_data(
             }
             for _, row in detail_items_df.iterrows()
         ]
+    step_start = record_perf_step(perf_rows, "order_record_build", step_start)
 
     order_records.sort(key=lambda item: (item["startDate"], item["displayName"]))
     available_months_set = set()
@@ -1496,6 +1590,7 @@ def load_dashboard_data(
             else:
                 cursor = date(cursor.year, cursor.month + 1, 1)
     available_months = sorted(available_months_set)
+    step_start = record_perf_step(perf_rows, "available_months_build", step_start)
 
     return {
         "orders": order_records,
@@ -1506,6 +1601,7 @@ def load_dashboard_data(
         "source_titles": latest_titles,
         "north_america_keyword_rows": na_keyword_rows,
         "north_america_active_keywords": na_active_keywords,
+        "perf_load_ms": perf_rows,
     }
 
 
@@ -2391,14 +2487,18 @@ def load_north_america_keywords(spreadsheet) -> tuple[list[dict], list[str]]:
 
 
 def main():
+    run_perf_rows: list[dict] = []
+    run_step_start = perf_counter()
     inject_css()
     initialize_state()
+    run_step_start = record_perf_step(run_perf_rows, "initialize_state", run_step_start)
     try:
         data = load_dashboard_data(
             int(st.session_state.get("etc_amount_threshold", 100_000_000)),
             product_family=st.session_state.get("product_family", "\ucda9\uc8fc"),
             export_only_nonstock_custom=bool(st.session_state.get("export_only_nonstock_custom", True)),
         )
+        run_step_start = record_perf_step(run_perf_rows, "load_dashboard_data_call", run_step_start)
     except ValueError as exc:
         st.error(f"\ub370\uc774\ud130 \uc2dc\ud2b8 \ub85c\ub4dc \uc2e4\ud328: {exc}")
         st.info(
@@ -2424,9 +2524,12 @@ def main():
     st.session_state["selected_order_ids"] = selected_order_ids
     if st.session_state["detail_selected_order_id"] not in {order["id"] for order in data["orders"]}:
         st.session_state["detail_selected_order_id"] = st.session_state["selected_order_id"]
+    run_step_start = record_perf_step(run_perf_rows, "session_state_sync", run_step_start)
 
     render_header(data)
+    run_step_start = record_perf_step(run_perf_rows, "render_header", run_step_start)
     filtered_orders = get_filtered_orders(data)
+    run_step_start = record_perf_step(run_perf_rows, "get_filtered_orders", run_step_start)
 
     if not filtered_orders:
         # 필터 결과가 없어도 캘린더/상세 레이아웃은 유지해서
@@ -2436,10 +2539,22 @@ def main():
         st.session_state["drilldown_order_id"] = None
 
     render_metrics(filtered_orders)
+    run_step_start = record_perf_step(run_perf_rows, "render_metrics", run_step_start)
     # Calendar interaction can update/clear popup state.
     # Render dialogs after calendar handling to avoid popup flash.
     render_calendar_and_detail(filtered_orders, data, available_months)
+    run_step_start = record_perf_step(run_perf_rows, "render_calendar_and_detail", run_step_start)
     render_dialogs(filtered_orders, data)
+    run_step_start = record_perf_step(run_perf_rows, "render_dialogs", run_step_start)
+
+    if SHOW_PERF_LOG_PANEL:
+        load_perf_rows = data.get("perf_load_ms", []) if isinstance(data, dict) else []
+        with st.sidebar.expander("실행 성능 로그", expanded=False):
+            if load_perf_rows:
+                st.caption("load_dashboard_data 내부 단계 (ms)")
+                st.dataframe(pd.DataFrame(load_perf_rows), use_container_width=True, hide_index=True)
+            st.caption("main 렌더 단계 (ms)")
+            st.dataframe(pd.DataFrame(run_perf_rows), use_container_width=True, hide_index=True)
 
 
 def render_order_list(filtered_orders: list[dict]):

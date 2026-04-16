@@ -1,7 +1,7 @@
 import argparse
 import math
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import gspread
@@ -13,6 +13,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
 ]
+
+SPREADSHEET_CELL_LIMIT = 10_000_000
+IMMUTABLE_WORKSHEET_TITLES = {"북미키워드"}
 
 TYPE_RULES = [
     (
@@ -43,6 +46,18 @@ def normalize_col_name(name: str) -> str:
 
 
 def parse_args() -> argparse.Namespace:
+    def positive_int(value: str) -> int:
+        parsed = int(value)
+        if parsed <= 0:
+            raise argparse.ArgumentTypeError("must be a positive integer")
+        return parsed
+
+    def non_negative_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("must be a non-negative integer")
+        return parsed
+
     parser = argparse.ArgumentParser(
         description="Upload local Excel files to Google Sheets with timestamped worksheet names."
     )
@@ -64,7 +79,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--max-rows-per-batch",
-        type=int,
+        type=positive_int,
         default=1000,
         help="How many rows to upload per API call.",
     )
@@ -82,6 +97,20 @@ def parse_args() -> argparse.Namespace:
         "--cleanup-apply",
         action="store_true",
         help="Actually delete old worksheets when --cleanup-daily is set.",
+    )
+    parser.add_argument(
+        "--skip-read-errors",
+        action="store_true",
+        help="Skip files that fail to read and continue with the rest.",
+    )
+    parser.add_argument(
+        "--cleanup-protect-days",
+        type=non_negative_int,
+        default=0,
+        help=(
+            "Protect worksheets from the most recent N days during automatic capacity cleanup. "
+            "Default is 0 (no additional day protection)."
+        ),
     )
     return parser.parse_args()
 
@@ -175,6 +204,130 @@ def plan_daily_cleanup(spreadsheet):
     return keep, delete
 
 
+def run_daily_cleanup(spreadsheet, apply: bool, heading: str) -> None:
+    keep, delete = plan_daily_cleanup(spreadsheet)
+    delete = [item for item in delete if item["title"] not in IMMUTABLE_WORKSHEET_TITLES]
+    print(f"\n{heading}")
+    for item in sorted(keep, key=lambda x: (x["label"], x["day"])):
+        print(f"  keep   -> {item['title']}")
+    for item in sorted(delete, key=lambda x: (x["label"], x["day"], x["hhmm"])):
+        print(f"  delete -> {item['title']}")
+
+    if apply:
+        for item in delete:
+            spreadsheet.del_worksheet(item["worksheet"])
+            print(f"  deleted -> {item['title']}")
+    else:
+        print("  (preview only) add --cleanup-apply to delete listed worksheets.")
+
+
+def worksheet_cell_count(worksheet) -> int:
+    return max(int(worksheet.row_count), 1) * max(int(worksheet.col_count), 1)
+
+
+def required_cells_for_job(job: dict) -> int:
+    required_rows = max(int(job["rows"]) + 1, 1)  # +1 for header row
+    required_cols = max(int(job["cols"]), 1)
+    return required_rows * required_cols
+
+
+def projected_cell_growth(spreadsheet, jobs: list[dict]) -> int:
+    worksheets_by_title = {ws.title: ws for ws in spreadsheet.worksheets()}
+    growth = 0
+    for job in jobs:
+        title = job["worksheet_title"]
+        required = required_cells_for_job(job)
+        existing = worksheets_by_title.get(title)
+        if existing is None:
+            growth += required
+            continue
+        growth += max(required - worksheet_cell_count(existing), 0)
+    return growth
+
+
+def free_cells_for_upload(
+    spreadsheet,
+    jobs: list[dict],
+    protect_days: int = 0,
+    cell_limit: int = SPREADSHEET_CELL_LIMIT,
+) -> None:
+    total_cells = sum(worksheet_cell_count(ws) for ws in spreadsheet.worksheets())
+    growth = projected_cell_growth(spreadsheet, jobs)
+    projected = total_cells + growth
+    if projected <= cell_limit:
+        return
+
+    need_to_free = projected - cell_limit
+    known_labels = {label for label, _ in TYPE_RULES}
+    protected_titles = {job["worksheet_title"] for job in jobs}
+    protected_titles.update(IMMUTABLE_WORKSHEET_TITLES)
+    # Keep at least one latest worksheet per known label.
+    latest_title_per_label: dict[str, str] = {}
+    for ws in spreadsheet.worksheets():
+        parsed = parse_worksheet_stamp(ws.title)
+        if not parsed:
+            continue
+        label, day, hhmm = parsed
+        if label not in known_labels:
+            continue
+        stamp = f"{day}_{hhmm}"
+        existing_title = latest_title_per_label.get(label)
+        if existing_title is None:
+            latest_title_per_label[label] = ws.title
+            continue
+        existing_parsed = parse_worksheet_stamp(existing_title)
+        if existing_parsed is None:
+            latest_title_per_label[label] = ws.title
+            continue
+        existing_stamp = f"{existing_parsed[1]}_{existing_parsed[2]}"
+        if stamp > existing_stamp:
+            latest_title_per_label[label] = ws.title
+    protected_titles.update(latest_title_per_label.values())
+
+    protected_day_from = (datetime.now().date() - timedelta(days=protect_days)) if protect_days > 0 else None
+    candidates = []
+    for ws in spreadsheet.worksheets():
+        parsed = parse_worksheet_stamp(ws.title)
+        if not parsed:
+            continue
+        label, day, hhmm = parsed
+        if label not in known_labels:
+            continue
+        if ws.title in protected_titles:
+            continue
+        if protected_day_from is not None:
+            sheet_day = datetime.strptime(day, "%Y-%m-%d").date()
+            if sheet_day >= protected_day_from:
+                continue
+        candidates.append({"worksheet": ws, "title": ws.title, "day": day, "hhmm": hhmm, "cells": worksheet_cell_count(ws)})
+
+    candidates.sort(key=lambda x: (x["day"], x["hhmm"], x["title"]))
+    if not candidates:
+        raise SystemExit(
+            f"Insufficient spreadsheet cell capacity: need to free at least {need_to_free} cells, "
+            "but no managed worksheets are available to delete."
+        )
+
+    print(
+        "\nauto capacity cleanup before upload:"
+        f" current_cells={total_cells} projected_growth={growth} limit={cell_limit} protect_days={protect_days}"
+    )
+    freed = 0
+    for item in candidates:
+        spreadsheet.del_worksheet(item["worksheet"])
+        freed += item["cells"]
+        print(f"  deleted(capacity) -> {item['title']} cells={item['cells']}")
+        if freed >= need_to_free:
+            break
+
+    if freed < need_to_free:
+        raise SystemExit(
+            f"Insufficient spreadsheet cell capacity after cleanup: "
+            f"needed={need_to_free}, freed={freed}. "
+            f"Delete more old worksheets, lower --cleanup-protect-days (current={protect_days}), or use a new spreadsheet."
+        )
+
+
 def read_excel_file(path: Path) -> pd.DataFrame:
     return pd.read_excel(path, dtype=object)
 
@@ -190,6 +343,10 @@ def preprocess_dataframe(df: pd.DataFrame, label: str) -> pd.DataFrame:
     return processed
 
 
+def same_columns_in_order(left: pd.DataFrame, right: pd.DataFrame) -> bool:
+    return list(left.columns) == list(right.columns)
+
+
 def main() -> None:
     args = parse_args()
     input_dir = Path(args.input_dir)
@@ -200,37 +357,115 @@ def main() -> None:
 
     uploaded_at = args.uploaded_at or datetime.now().strftime("%Y-%m-%d_%H%M")
 
-    jobs = []
+    raw_jobs = []
+    read_errors = []
     for path in files:
-        raw_df = read_excel_file(path)
+        try:
+            raw_df = read_excel_file(path)
+        except Exception as exc:
+            if args.skip_read_errors:
+                read_errors.append((path, exc))
+                continue
+            raise SystemExit(f"Failed to read '{path.name}': {exc}") from exc
         label = classify_columns(list(raw_df.columns))
         df = preprocess_dataframe(raw_df, label)
-        worksheet_title = sanitize_worksheet_title(f"{label}_{uploaded_at}")
-        jobs.append(
+        raw_jobs.append(
             {
                 "path": path,
                 "label": label,
                 "rows": len(df),
                 "cols": len(df.columns),
-                "worksheet_title": worksheet_title,
                 "df": df,
             }
         )
 
+    if not raw_jobs:
+        raise SystemExit("No readable files to upload.")
+
+    # Merge files by label when their header columns are identical in the same order.
+    jobs_by_label = {}
+    for job in raw_jobs:
+        label = job["label"]
+        if label not in jobs_by_label:
+            jobs_by_label[label] = {
+                "label": label,
+                "paths": [job["path"]],
+                "df": job["df"],
+            }
+            continue
+
+        existing = jobs_by_label[label]
+        existing_df = existing["df"]
+        incoming_df = job["df"]
+        if not same_columns_in_order(existing_df, incoming_df):
+            raise SystemExit(
+                f"Cannot merge files for label '{label}' because column headers differ. "
+                f"first={existing['paths'][0].name}, second={job['path'].name}"
+            )
+        existing["paths"].append(job["path"])
+        existing["df"] = pd.concat([existing_df, incoming_df], ignore_index=True)
+
+    jobs = []
+    for label, merged in sorted(jobs_by_label.items(), key=lambda x: x[0]):
+        merged_df = merged["df"]
+        worksheet_title = sanitize_worksheet_title(f"{label}_{uploaded_at}")
+        jobs.append(
+            {
+                "path": merged["paths"][0],
+                "source_paths": merged["paths"],
+                "label": label,
+                "rows": len(merged_df),
+                "cols": len(merged_df.columns),
+                "worksheet_title": worksheet_title,
+                "df": merged_df,
+            }
+        )
+
+    seen_titles = set()
+    duplicate_titles = set()
+    for job in jobs:
+        title = job["worksheet_title"]
+        if title in seen_titles:
+            duplicate_titles.add(title)
+        seen_titles.add(title)
+    if duplicate_titles:
+        duplicates_text = ", ".join(sorted(duplicate_titles))
+        raise SystemExit(
+            "Detected duplicate worksheet titles in this run. "
+            f"Adjust --uploaded-at or inputs and retry. titles={duplicates_text}"
+        )
+
     print("upload plan:")
     for job in jobs:
+        source_names = ",".join(path.name for path in job["source_paths"])
         print(
-            f"- file={job['path'].name} "
+            f"- files={source_names} "
             f"type={job['label']} "
             f"rows={job['rows']} cols={job['cols']} "
             f"worksheet={job['worksheet_title']}"
         )
+    for path, exc in read_errors:
+        print(f"- skipped file={path.name} reason={exc}")
 
     if args.dry_run and not args.cleanup_daily:
         return
 
     client = authorize(args.credentials)
     spreadsheet = client.open_by_key(args.spreadsheet_id)
+
+    # Free up cells first when cleanup deletion is requested.
+    # This avoids hitting the 10M-cell spreadsheet limit during new sheet creation.
+    if args.cleanup_daily and args.cleanup_apply:
+        run_daily_cleanup(
+            spreadsheet=spreadsheet,
+            apply=True,
+            heading="cleanup plan before upload (free cells first):",
+        )
+        free_cells_for_upload(
+            spreadsheet=spreadsheet,
+            jobs=jobs,
+            protect_days=args.cleanup_protect_days,
+        )
 
     if not args.dry_run:
         for job in jobs:
@@ -247,22 +482,19 @@ def main() -> None:
             print(f"  uploaded -> {job['worksheet_title']}")
 
     if args.cleanup_daily:
-        keep, delete = plan_daily_cleanup(spreadsheet)
-        print("\ncleanup plan (keep latest per type/day):")
-        for item in sorted(keep, key=lambda x: (x["label"], x["day"])):
-            print(f"  keep   -> {item['title']}")
-        for item in sorted(delete, key=lambda x: (x["label"], x["day"], x["hhmm"])):
-            print(f"  delete -> {item['title']}")
-
-        if args.cleanup_apply:
-            for item in delete:
-                spreadsheet.del_worksheet(item["worksheet"])
-                print(f"  deleted -> {item['title']}")
-        else:
-            print("  (preview only) add --cleanup-apply to delete listed worksheets.")
+        run_daily_cleanup(
+            spreadsheet=spreadsheet,
+            apply=args.cleanup_apply,
+            heading="cleanup plan after upload (keep latest per type/day):",
+        )
 
     print(f"done: {spreadsheet.url}")
 
 
 if __name__ == "__main__":
     main()
+    def non_negative_int(value: str) -> int:
+        parsed = int(value)
+        if parsed < 0:
+            raise argparse.ArgumentTypeError("must be a non-negative integer")
+        return parsed

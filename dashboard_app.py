@@ -942,7 +942,11 @@ def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=300, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
-def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
+def load_dashboard_data(
+    etc_amount_threshold: int = 100_000_000,
+    product_family: str = "\ucda9\uc8fc",
+    export_only_nonstock_custom: bool = True,
+):
     spreadsheet = open_spreadsheet()
     worksheets = spreadsheet.worksheets()
     na_keyword_rows, na_active_keywords = load_north_america_keywords(spreadsheet)
@@ -1059,7 +1063,7 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
     merged["대표주소"] = merged["납품처주소"].replace("", pd.NA).fillna("주소 미등록")
     merged["기본주소"] = merged["대표주소"].map(normalize_address).replace("", "주소 미등록")
     merged["대표사업소"] = merged["관리사업소"].replace("", pd.NA).fillna(merged["사업소"])
-    merged["구분"] = merged["대표사업소"].apply(lambda value: "수출" if str(value).strip() == "수출사업소" else "내수")
+    merged["구분"] = merged["대표사업소"].apply(lambda value: "수출" if "수출" in str(value).strip() else "내수")
     merged["대표프로젝트명"] = merged["대표수주건명"].map(simplify_project_name)
     merged["표시프로젝트명"] = merged["상세건명"].map(lambda value: build_display_name(value, ""))
     merged["프로젝트키"] = merged["대표수주건명"].map(normalize_project_key)
@@ -1141,7 +1145,9 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
             cluster_key = f"{base_address}||{cluster_idx:02d}"
             merged.loc[cluster["indices"], "통합수주건키"] = cluster_key
 
-    is_target_product = merged["제품구분"].isin(["충주1제품", "충주2제품", "F우레탄제품"])
+    is_target_product = merged["제품구분"].isin(["충주1제품", "충주2제품", "충주상품", "충주2상품", "F우레탄제품"])
+    if product_family == "\uc548\uc131":
+        is_target_product = merged["제품구분"].astype(str).str.contains("\uc548\uc131", na=False)
     is_non_stock = merged["재고구분"].astype(str).str.strip() == "비재고"
     is_custom = merged["표준구분"].astype(str).str.contains("주문품", na=False)
     merged["주요후보"] = is_target_product & is_non_stock & is_custom
@@ -1174,7 +1180,7 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
     order_amount_major_keys = set()
     order_amount_candidate = merged[
         merged["표준구분"].astype(str).str.contains("주문품", na=False)
-        & merged["제품구분"].isin(["충주1제품", "충주2제품", "F우레탄제품"])
+        & is_target_product
     ].copy()
     if not order_amount_candidate.empty:
         order_amount_agg = (
@@ -1191,9 +1197,7 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
     major_group_keys.update(order_amount_major_keys)
     # 기타 후보: 표준품/주문품 무관 + 충주1/충주2/F우레탄 제품의 통합 수주금액 합계 1억 이상
     etc_group_keys = set()
-    etc_amount_candidate = merged[
-        merged["제품구분"].isin(["충주1제품", "충주2제품", "F우레탄제품"])
-    ].copy()
+    etc_amount_candidate = merged[is_target_product].copy()
     if not etc_amount_candidate.empty:
         etc_amount_agg = (
             etc_amount_candidate.groupby("통합수주건키", dropna=False)
@@ -1209,33 +1213,41 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
     office_col_for_export = get_existing_column(merged, ["대표사업소", "사업소", "관리사업소"])
     product_col_for_export = get_existing_column(merged, ["제품구분"])
     standard_col_for_export = get_existing_column(merged, ["표준구분", "수지구분"])
-    north_america_product_types = {
-        "충주1제품",
-        "충주2제품",
-        "F우레탄제품",
-        "베트남상품",
-        "목제상품",
-        "목제5상품",
-        "목제6상품",
-    }
+    north_america_product_types = (
+        {
+            "충주1제품",
+            "충주2제품",
+            "충주상품",
+            "충주2상품",
+            "F우레탄제품",
+            "베트남상품",
+            "목제상품",
+            "목제5상품",
+            "목제6상품",
+        }
+        if product_family != "\uc548\uc131"
+        else set()
+    )
     if office_col_for_export:
         export_mask = merged[office_col_for_export].astype(str).str.contains("수출", na=False)
         if product_col_for_export:
-            export_product_mask = merged[product_col_for_export].isin(["충주1제품", "충주2제품", "F우레탄제품"])
+            export_product_mask = is_target_product
         else:
             export_product_mask = pd.Series(False, index=merged.index)
-        if standard_col_for_export:
-            export_standard_mask = merged[standard_col_for_export].astype(str).str.contains("주문품", na=False)
+        if export_only_nonstock_custom:
+            export_target_mask = export_mask & export_product_mask & is_non_stock & is_custom
         else:
-            export_standard_mask = pd.Series(False, index=merged.index)
-        export_target_mask = export_mask & export_product_mask & export_standard_mask
+            export_target_mask = export_mask & export_product_mask
         export_group_keys = set(merged.loc[export_target_mask, "통합수주건키"].astype(str).unique())
         major_group_keys.update(export_group_keys)
 
         # 북미는 수출 후보와 완전히 분리해서 판정한다.
         # 조건: 수출사업소 + (대리점/실적대리점 북미키워드 매칭) + 북미 대상 제품구분
         if product_col_for_export:
-            north_america_product_mask = merged[product_col_for_export].isin(north_america_product_types)
+            if product_family == "\uc548\uc131":
+                north_america_product_mask = merged[product_col_for_export].astype(str).str.contains("\uc548\uc131", na=False)
+            else:
+                north_america_product_mask = merged[product_col_for_export].isin(north_america_product_types)
         else:
             north_america_product_mask = pd.Series(False, index=merged.index)
         dealer_text = (
@@ -1322,23 +1334,20 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
             ).tolist()
         )
         matching_keywords = find_matching_keywords(dealer_source_text, na_active_keywords)
-        north_america_product_types = {
-            "충주1제품",
-            "충주2제품",
-            "F우레탄제품",
-            "베트남상품",
-            "목제상품",
-            "목제5상품",
-            "목제6상품",
-        }
-        north_america_product_match = (
-            group["제품구분"].astype(str).isin(north_america_product_types).any()
-            if "제품구분" in group.columns
-            else False
-        )
+        if "제품구분" in group.columns:
+            if product_family == "\uc548\uc131":
+                north_america_product_match = group["제품구분"].astype(str).str.contains("\uc548\uc131", na=False).any()
+            else:
+                north_america_product_match = (
+                    group["제품구분"].astype(str).isin(north_america_product_types).any()
+                    if north_america_product_types
+                    else False
+                )
+        else:
+            north_america_product_match = False
         representative_site = first_nonempty(group["기본주소"], "주소 미등록")
         representative_office = first_nonempty(group["대표사업소"], "사업소 미확인")
-        representative_type = "수출" if (group["대표사업소"].astype(str).str.strip() == "수출사업소").any() else "내수"
+        representative_type = "수출" if group["대표사업소"].astype(str).str.contains("수출", na=False).any() else "내수"
         is_north_america = bool(matching_keywords) and north_america_product_match and representative_type == "수출"
 
         order_records.append(
@@ -1462,7 +1471,24 @@ def load_dashboard_data(etc_amount_threshold: int = 100_000_000):
         ]
 
     order_records.sort(key=lambda item: (item["startDate"], item["displayName"]))
-    available_months = sorted({record["startDate"][:7] for record in order_records if record["startDate"]})
+    available_months_set = set()
+    for record in order_records:
+        try:
+            start_day = date.fromisoformat(str(record.get("startDate", "")))
+            end_day = date.fromisoformat(str(record.get("endDate", "")))
+        except Exception:
+            continue
+        if end_day < start_day:
+            start_day, end_day = end_day, start_day
+        cursor = date(start_day.year, start_day.month, 1)
+        end_month = date(end_day.year, end_day.month, 1)
+        while cursor <= end_month:
+            available_months_set.add(f"{cursor.year:04d}-{cursor.month:02d}")
+            if cursor.month == 12:
+                cursor = date(cursor.year + 1, 1, 1)
+            else:
+                cursor = date(cursor.year, cursor.month + 1, 1)
+    available_months = sorted(available_months_set)
 
     return {
         "orders": order_records,
@@ -1526,14 +1552,30 @@ def initialize_state():
         st.session_state["etc_amount_threshold_input"] = 100_000_000
     if "etc_amount_threshold_input_text" not in st.session_state:
         st.session_state["etc_amount_threshold_input_text"] = "100,000,000"
+    if "product_family" not in st.session_state:
+        st.session_state["product_family"] = "\ucda9\uc8fc"
+    if "export_only_nonstock_custom" not in st.session_state:
+        st.session_state["export_only_nonstock_custom"] = False
+    if "export_filter_mode" not in st.session_state:
+        st.session_state["export_filter_mode"] = "비재고/주문품" if st.session_state["export_only_nonstock_custom"] else "전체"
 
 
 def get_filtered_orders(data: dict):
     month_value = st.session_state["selected_month"]
     business_type = st.session_state["business_type"]
+    year, month = map(int, month_value.split("-"))
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
     filtered = []
     for order in data["orders"]:
-        month_match = order["startDate"].startswith(month_value)
+        try:
+            order_start = date.fromisoformat(str(order.get("startDate", "")))
+            order_end = date.fromisoformat(str(order.get("endDate", "")))
+            if order_end < order_start:
+                order_start, order_end = order_end, order_start
+            month_match = not (order_end < month_start or order_start > month_end)
+        except Exception:
+            month_match = False
         type_match = business_type == "전체" or order["type"] == business_type
         if month_match and type_match:
             filtered.append(order)
@@ -1729,6 +1771,13 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
     left_col, right_col = st.columns([1, 1])
     with left_col:
         with st.container(border=True):
+            st.radio(
+                "\uc0ac\uc5c5\uc7a5",
+                options=["\ucda9\uc8fc", "\uc548\uc131"],
+                horizontal=True,
+                key="product_family",
+                on_change=on_top_filter_change,
+            )
             filter_col1, filter_col2 = st.columns([1.35, 1])
             with filter_col1:
                 st.radio("사업소 필터", ["전체", "내수", "수출"], horizontal=True, key="business_type", on_change=on_top_filter_change)
@@ -2089,6 +2138,13 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
     left_col, right_col = st.columns([1, 1])
     with left_col:
         with st.container(border=True):
+            st.radio(
+                "\uc0ac\uc5c5\uc7a5",
+                options=["충주", "안성"],
+                horizontal=True,
+                key="product_family",
+                on_change=on_top_filter_change,
+            )
             filter_col1, filter_col2 = st.columns([1.35, 1])
             with filter_col1:
                 st.radio(
@@ -2330,7 +2386,19 @@ def load_north_america_keywords(spreadsheet) -> tuple[list[dict], list[str]]:
 def main():
     inject_css()
     initialize_state()
-    data = load_dashboard_data(int(st.session_state.get("etc_amount_threshold", 100_000_000)))
+    try:
+        data = load_dashboard_data(
+            int(st.session_state.get("etc_amount_threshold", 100_000_000)),
+            product_family=st.session_state.get("product_family", "\ucda9\uc8fc"),
+            export_only_nonstock_custom=bool(st.session_state.get("export_only_nonstock_custom", True)),
+        )
+    except ValueError as exc:
+        st.error(f"\ub370\uc774\ud130 \uc2dc\ud2b8 \ub85c\ub4dc \uc2e4\ud328: {exc}")
+        st.info(
+            "\uad6c\uae00 \uc2dc\ud2b8\uc5d0 \ud544\uc218 \uc6cc\ud06c\uc2dc\ud2b8(\uc218\uc8fc\ub0b4\uc5ed\uc815\ubcf4/\uc218\uc8fc\uad00\ub9ac/\uacf5\uc815 \uc9c4\ud589\uc815\ubcf4)\uac00 \uc874\uc7ac\ud558\ub294\uc9c0 \ud655\uc778\ud574\uc8fc\uc138\uc694. "
+            "\uc5c5\ub85c\ub4dc \uc9c1\ud6c4 \uc6a9\ub7c9 \uc815\ub9ac\uc5d0\uc11c \uc2dc\ud2b8\uac00 \uc0ad\uc81c\ub41c \uacbd\uc6b0, \ub2e4\uc2dc \uc5c5\ub85c\ub4dc\ud558\uba74 \ubcf5\uad6c\ub429\ub2c8\ub2e4."
+        )
+        st.stop()
     available_months = data["available_months"] or [today_kst().strftime("%Y-%m")]
     current_month = today_kst().strftime("%Y-%m")
     if st.session_state["selected_month"] not in available_months:
@@ -2503,16 +2571,29 @@ def render_metrics(filtered_orders: list[dict]):
 def get_filtered_orders(data: dict):
     month_value = st.session_state["selected_month"]
     business_type = st.session_state["business_type"]
+    year, month = map(int, month_value.split("-"))
+    month_start = date(year, month, 1)
+    month_end = date(year, month, calendar.monthrange(year, month)[1])
     filtered = []
     for order in data["orders"]:
-        month_match = order["startDate"].startswith(month_value)
+        try:
+            order_start = date.fromisoformat(str(order.get("startDate", "")))
+            order_end = date.fromisoformat(str(order.get("endDate", "")))
+            if order_end < order_start:
+                order_start, order_end = order_end, order_start
+            month_match = not (order_end < month_start or order_start > month_end)
+        except Exception:
+            month_match = False
         if business_type == "전체":
             type_match = not bool(order.get("isEtc"))
         elif business_type == "내수":
             type_match = order["type"] == "내수" and not bool(order.get("isEtc"))
         elif business_type == "수출":
             # 수출은 북미 포함
-            type_match = order["type"] == "수출" and not bool(order.get("isEtc"))
+            if bool(st.session_state.get("export_only_nonstock_custom", True)):
+                type_match = order["type"] == "수출" and not bool(order.get("isEtc"))
+            else:
+                type_match = order["type"] == "수출"
         elif business_type == "북미":
             # 북미는 수출 중 북미건만
             type_match = order["type"] == "수출" and bool(order.get("isNorthAmerica")) and not bool(order.get("isEtc"))
@@ -2630,6 +2711,13 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
     left_col, right_col = st.columns([1, 1])
     with left_col:
         with st.container(border=True):
+            st.radio(
+                "\uc0ac\uc5c5\uc7a5",
+                options=["충주", "안성"],
+                horizontal=True,
+                key="product_family",
+                on_change=on_top_filter_change,
+            )
             filter_col1, filter_col2 = st.columns([1.35, 1])
             with filter_col1:
                 st.radio(
@@ -2647,6 +2735,26 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                     key="selected_month",
                     on_change=on_top_filter_change,
                 )
+            if st.session_state.get("business_type") == "수출":
+                mode_col, _ = st.columns([1.7, 1])
+                with mode_col:
+                    if hasattr(st, "segmented_control"):
+                        export_mode = st.segmented_control(
+                            "수출 기준",
+                            options=["전체", "비재고/주문품"],
+                            key="export_filter_mode",
+                        )
+                    else:
+                        export_mode = st.radio(
+                            "수출 기준",
+                            options=["전체", "비재고/주문품"],
+                            horizontal=True,
+                            key="export_filter_mode",
+                        )
+                export_strict_on = export_mode == "비재고/주문품"
+                if export_strict_on != bool(st.session_state.get("export_only_nonstock_custom", False)):
+                    st.session_state["export_only_nonstock_custom"] = export_strict_on
+                    st.rerun()
             if st.session_state.get("business_type") == "기타":
                 current_threshold = int(st.session_state.get("etc_amount_threshold", 100_000_000))
                 if "etc_amount_threshold_draft" not in st.session_state:
@@ -2806,46 +2914,61 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
                     if row.get("관련 수주번호", "") in selected_related_nos
                 ]
 
-            chgju_products = {"충주1제품", "충주2제품", "F우레탄제품"}
+            chgju_products = {"충주1제품", "충주2제품", "충주상품", "충주2상품", "F우레탄제품"}
             wood_products = {"F우레탄제품", "베트남상품", "목제상품", "목제5상품", "목제6상품"}
+            product_family = st.session_state.get("product_family", "충주")
+            export_strict_on = bool(st.session_state.get("export_only_nonstock_custom", False))
+            standard_options = ["전체", "주문품"] if export_strict_on else ["전체", "표준품", "주문품"]
+            product_options = ["전체", "안성제품", "안성상품"] if product_family == "안성" else ["전체", "충주", "목제상품"]
 
             if st.session_state.get("item_filter_last_order_id") != current_order_id:
                 if selected_order.get("isNorthAmerica"):
                     st.session_state[f"item_standard_filter_{current_order_id}"] = "전체"
-                    st.session_state[f"item_product_filter_{current_order_id}"] = "목제상품"
+                    st.session_state[f"item_product_filter_{current_order_id}"] = "전체"
                 elif selected_order.get("type") == "내수":
-                    st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
-                    st.session_state[f"item_product_filter_{current_order_id}"] = "충주"
+                    st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품" if export_strict_on else "전체"
+                    st.session_state[f"item_product_filter_{current_order_id}"] = "충주" if product_family != "안성" else "안성제품"
                 else:
-                    st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품"
+                    st.session_state[f"item_standard_filter_{current_order_id}"] = "주문품" if export_strict_on else "전체"
                     default_product = "전체"
                     if selected_order_rows_for_default:
                         default_df = pd.DataFrame(selected_order_rows_for_default)
-                        if "표준구분" in default_df.columns:
+                        if export_strict_on and "표준구분" in default_df.columns:
                             default_df = default_df[
                                 default_df["표준구분"].astype(str).str.contains("주문품", na=False)
                             ]
                         product_values = set(default_df.get("제품구분", pd.Series(dtype=str)).astype(str))
-                        if any(product in chgju_products for product in product_values):
-                            default_product = "충주"
-                        elif any(product in wood_products for product in product_values):
-                            default_product = "목제상품"
+                        if product_family == "안성":
+                            if any("안성제품" in str(product) for product in product_values):
+                                default_product = "안성제품"
+                            elif any("안성상품" in str(product) for product in product_values):
+                                default_product = "안성상품"
+                        else:
+                            if any(product in chgju_products for product in product_values):
+                                default_product = "충주"
+                            elif any(product in wood_products for product in product_values):
+                                default_product = "목제상품"
                     st.session_state[f"item_product_filter_{current_order_id}"] = default_product
                 st.session_state["item_filter_last_order_id"] = current_order_id
 
+            current_standard_key = f"item_standard_filter_{current_order_id}"
             current_product_key = f"item_product_filter_{current_order_id}"
             if st.session_state.get(current_product_key) == "목제":
                 st.session_state[current_product_key] = "목제상품"
+            if st.session_state.get(current_standard_key) not in standard_options:
+                st.session_state[current_standard_key] = "주문품" if export_strict_on else "전체"
+            if st.session_state.get(current_product_key) not in product_options:
+                st.session_state[current_product_key] = product_options[0]
 
             filter_cols = st.columns(3)
             standard_filter = filter_cols[0].selectbox(
                 "표준구분",
-                options=["전체", "표준품", "주문품"],
-                key=f"item_standard_filter_{current_order_id}",
+                options=standard_options,
+                key=current_standard_key,
             )
             product_filter = filter_cols[1].selectbox(
                 "제품구분",
-                options=["전체", "충주", "목제상품"],
+                options=product_options,
                 key=current_product_key,
             )
             return_only_filter = filter_cols[2].toggle(
@@ -2868,12 +2991,29 @@ def render_calendar_and_detail(filtered_orders: list[dict], data: dict, availabl
 
                 if effective_standard in {"주문품", "표준품"} and "표준구분" in df.columns:
                     df = df[df["표준구분"].astype(str).str.contains(effective_standard, na=False)]
-                if effective_product != "전체" and "제품구분" in df.columns:
-                    if effective_product == "충주":
-                        allowed_products = chgju_products
+                if "제품구분" in df.columns:
+                    if product_family == "안성":
+                        family_mask = df["제품구분"].astype(str).str.contains("안성", na=False)
                     else:
-                        allowed_products = chgju_products | wood_products
-                    df = df[df["제품구분"].isin(allowed_products)]
+                        # 충주 화면의 "전체"는 기존 "목제상품" 필터(충주+목제군)를 의미.
+                        family_mask = df["제품구분"].isin(chgju_products | wood_products)
+
+                    if effective_product == "전체":
+                        df = df[family_mask]
+                    elif effective_product == "충주":
+                        df = df[df["제품구분"].isin(chgju_products)]
+                    elif effective_product == "목제상품":
+                        df = df[df["제품구분"].isin(wood_products)]
+                    elif effective_product == "안성제품":
+                        df = df[
+                            df["제품구분"].astype(str).str.contains("안성", na=False)
+                            & df["제품구분"].astype(str).str.contains("제품", na=False)
+                        ]
+                    elif effective_product == "안성상품":
+                        df = df[
+                            df["제품구분"].astype(str).str.contains("안성", na=False)
+                            & df["제품구분"].astype(str).str.contains("상품", na=False)
+                        ]
                 df = df.rename(columns={"품목명": "단품명칭", "수량": "수주량"})
                 if effective_return_only and "현재고" in df.columns and "수주량" in df.columns:
                     stock_series = pd.to_numeric(df["현재고"], errors="coerce").fillna(0)

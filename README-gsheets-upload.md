@@ -1,6 +1,6 @@
 # Google Sheets Upload
 
-현재 폴더의 `.xls` 파일을 읽어서 Google Spreadsheet에 새 워크시트로 업로드합니다.
+현재 폴더의 `.xls`, `.xlsx` 파일을 읽어서 Google Spreadsheet에 새 워크시트로 업로드합니다.
 
 워크시트 이름 규칙:
 
@@ -26,7 +26,7 @@ python -m pip install -r requirements-gsheets.txt
 python upload_xls_to_gsheets.py `
   --credentials .\streamlit-sheets-upload-34b193fd0a59.json `
   --spreadsheet-id "여기에_구글시트_ID" `
-  --pattern "*.xls" `
+  --pattern "*.xls,*.xlsx" `
   --dry-run
 ```
 
@@ -36,7 +36,7 @@ python upload_xls_to_gsheets.py `
 python upload_xls_to_gsheets.py `
   --credentials .\streamlit-sheets-upload-34b193fd0a59.json `
   --spreadsheet-id "여기에_구글시트_ID" `
-  --pattern "*.xls"
+  --pattern "*.xls,*.xlsx"
 ```
 
 ## 4. 참고

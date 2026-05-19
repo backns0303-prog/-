@@ -18,6 +18,7 @@ SCOPES = [
 
 SPREADSHEET_CELL_LIMIT = 10_000_000
 IMMUTABLE_WORKSHEET_TITLES = {"북미키워드"}
+DEFAULT_FILE_PATTERNS = ("*.xls", "*.xlsx")
 
 TYPE_RULES = [
     (
@@ -72,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--pattern",
-        default="*.xls",
-        help="Glob pattern for source files. Defaults to *.xls",
+        default=",".join(DEFAULT_FILE_PATTERNS),
+        help="Glob pattern(s) for source files. Comma-separated values are supported. Defaults to *.xls,*.xlsx",
     )
     parser.add_argument(
         "--uploaded-at",
@@ -135,7 +136,14 @@ def authorize(credentials_path: str) -> gspread.Client:
 
 
 def discover_files(input_dir: Path, pattern: str) -> list[Path]:
-    return sorted(path for path in input_dir.glob(pattern) if path.is_file())
+    patterns = [part.strip() for part in pattern.split(",") if part.strip()]
+    if not patterns:
+        patterns = list(DEFAULT_FILE_PATTERNS)
+
+    files: set[Path] = set()
+    for item in patterns:
+        files.update(path for path in input_dir.glob(item) if path.is_file())
+    return sorted(files)
 
 
 def classify_columns(columns: list[str]) -> str:

@@ -19,6 +19,17 @@ import streamlit.components.v1 as components
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from gspread.exceptions import WorksheetNotFound
 from google.oauth2.service_account import Credentials
+from upload_xls_to_gsheets import (
+    classify_columns,
+    dataframe_to_values,
+    free_cells_for_upload,
+    get_or_create_worksheet,
+    preprocess_dataframe,
+    run_daily_cleanup,
+    same_columns_in_order,
+    sanitize_worksheet_title,
+    upload_values,
+)
 
 
 st.set_page_config(page_title="품평/프로젝트 관리", layout="wide")
@@ -969,6 +980,155 @@ def worksheet_to_df(worksheet) -> pd.DataFrame:
     padded = [row + [""] * (len(header) - len(row)) for row in rows]
     df = pd.DataFrame(padded, columns=header)
     return df.fillna("")
+
+
+def build_upload_jobs_from_files(uploaded_files: list) -> list[dict]:
+    uploaded_at = datetime.now().strftime("%Y-%m-%d_%H%M")
+    raw_jobs: list[dict] = []
+
+    for uploaded_file in uploaded_files:
+        file_bytes = uploaded_file.getvalue()
+        workbook = pd.read_excel(io.BytesIO(file_bytes), sheet_name=None, dtype=object)
+        if not isinstance(workbook, dict):
+            workbook = {"Sheet1": workbook}
+
+        for sheet_name, raw_df in workbook.items():
+            if raw_df is None or len(raw_df.columns) == 0:
+                continue
+            label = classify_columns(list(raw_df.columns))
+            df = preprocess_dataframe(raw_df, label)
+            raw_jobs.append(
+                {
+                    "source_name": f"{uploaded_file.name}#{sheet_name}",
+                    "label": label,
+                    "df": df,
+                }
+            )
+
+    if not raw_jobs:
+        raise ValueError("읽을 수 있는 업로드 데이터가 없습니다.")
+
+    jobs_by_label: dict[str, dict] = {}
+    for job in raw_jobs:
+        label = job["label"]
+        if label not in jobs_by_label:
+            jobs_by_label[label] = {
+                "label": label,
+                "source_names": [job["source_name"]],
+                "df": job["df"],
+            }
+            continue
+
+        existing = jobs_by_label[label]
+        existing_df = existing["df"]
+        incoming_df = job["df"]
+        if not same_columns_in_order(existing_df, incoming_df):
+            raise ValueError(
+                f"같은 유형의 파일끼리 컬럼 구성이 다릅니다. "
+                f"first={existing['source_names'][0]}, second={job['source_name']}"
+            )
+        existing["source_names"].append(job["source_name"])
+        existing["df"] = pd.concat([existing_df, incoming_df], ignore_index=True)
+
+    jobs: list[dict] = []
+    for label, merged in sorted(jobs_by_label.items(), key=lambda item: item[0]):
+        merged_df = merged["df"]
+        jobs.append(
+            {
+                "label": label,
+                "source_names": merged["source_names"],
+                "rows": len(merged_df),
+                "cols": len(merged_df.columns),
+                "worksheet_title": sanitize_worksheet_title(f"{label}_{uploaded_at}"),
+                "df": merged_df,
+            }
+        )
+
+    seen_titles: set[str] = set()
+    for job in jobs:
+        title = job["worksheet_title"]
+        if title in seen_titles:
+            raise ValueError(
+                f"이번 업로드에서 동일한 워크시트 이름이 중복되었습니다: {title}"
+            )
+        seen_titles.add(title)
+
+    return jobs
+
+
+def upload_files_to_dashboard_spreadsheet(uploaded_files: list) -> list[dict]:
+    jobs = build_upload_jobs_from_files(uploaded_files)
+    spreadsheet = open_spreadsheet()
+
+    run_daily_cleanup(
+        spreadsheet=spreadsheet,
+        apply=True,
+        heading="cleanup plan before upload (free cells first):",
+    )
+    free_cells_for_upload(
+        spreadsheet=spreadsheet,
+        jobs=jobs,
+        protect_days=0,
+    )
+
+    for job in jobs:
+        values = dataframe_to_values(job["df"])
+        rows = len(values)
+        cols = max((len(row) for row in values), default=1)
+        worksheet = get_or_create_worksheet(
+            spreadsheet=spreadsheet,
+            title=job["worksheet_title"],
+            rows=rows,
+            cols=cols,
+        )
+        upload_values(
+            worksheet=worksheet,
+            values=values,
+            max_rows_per_batch=3000,
+            max_write_requests_per_minute=35,
+            max_write_retries=8,
+        )
+
+    run_daily_cleanup(
+        spreadsheet=spreadsheet,
+        apply=True,
+        heading="cleanup plan after upload (keep latest per type/day):",
+    )
+
+    load_dashboard_base_data.clear()
+    load_dashboard_data.clear()
+    return jobs
+
+
+def render_sidebar_upload_panel():
+    with st.sidebar.expander("엑셀 업로드", expanded=False):
+        st.caption("`.xls`, `.xlsx` 파일을 올리면 최신 워크시트가 추가됩니다.")
+        uploaded_files = st.file_uploader(
+            "업로드 파일",
+            type=["xls", "xlsx"],
+            accept_multiple_files=True,
+            label_visibility="collapsed",
+            key="dashboard_sheet_uploader",
+        )
+
+        if uploaded_files:
+            st.caption(f"{len(uploaded_files)}개 파일 선택됨")
+
+        if st.button("시트 업데이트", use_container_width=False, key="dashboard_sheet_upload_button"):
+            if not uploaded_files:
+                st.warning("업로드할 엑셀 파일을 먼저 선택해주세요.")
+                return
+
+            with st.spinner("업로드 중입니다..."):
+                try:
+                    jobs = upload_files_to_dashboard_spreadsheet(uploaded_files)
+                except Exception as exc:
+                    st.error(f"업로드 실패: {exc}")
+                    return
+
+            labels = ", ".join(job["label"] for job in jobs)
+            st.success(f"업로드 완료: {labels}")
+            st.rerun()
 
 
 def normalize_dataframe_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -2815,6 +2975,7 @@ def main():
     run_step_start = perf_counter()
     inject_css()
     initialize_state()
+    render_sidebar_upload_panel()
     run_step_start = record_perf_step(run_perf_rows, "initialize_state", run_step_start)
     try:
         data = load_dashboard_data(

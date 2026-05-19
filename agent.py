@@ -14,6 +14,7 @@ TYPE_RULES = [
     ("수주내역정보", {"수주번호", "주문일자", "확정납기", "단품코드", "수주량"}),
     ("수주관리", {"대리점", "CRM 고객코드", "수주건명"}),
 ]
+DEFAULT_FILE_PATTERNS = ("*.xls", "*.xlsx")
 
 
 def classify_columns(columns: list[str]) -> str:
@@ -36,7 +37,18 @@ def load_dataframe(path: Path) -> Any:
 
 
 def list_files(input_dir: Path, pattern: str) -> int:
-    files = sorted(path for path in input_dir.glob(pattern) if path.is_file())
+    patterns = [part.strip() for part in pattern.split(",") if part.strip()]
+    if not patterns:
+        patterns = list(DEFAULT_FILE_PATTERNS)
+
+    files = sorted(
+        {
+            path
+            for item in patterns
+            for path in input_dir.glob(item)
+            if path.is_file()
+        }
+    )
     if not files:
         print(f"No files found in {input_dir} with pattern {pattern}")
         return 0
@@ -68,13 +80,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser_list = subparsers.add_parser("list", help="List Excel files and their inferred upload type.")
     parser_list.add_argument("--input-dir", default=".", help="Directory containing source files.")
-    parser_list.add_argument("--pattern", default="*.xls", help="Glob pattern for source files.")
+    parser_list.add_argument(
+        "--pattern",
+        default=",".join(DEFAULT_FILE_PATTERNS),
+        help="Glob pattern(s) for source files. Comma-separated values are supported.",
+    )
 
     parser_preview = subparsers.add_parser("preview", help="Preview the upload plan without uploading.")
     parser_preview.add_argument("--credentials", required=True, help="Path to service account JSON file.")
     parser_preview.add_argument("--spreadsheet-id", required=True, help="Target Google Spreadsheet ID.")
     parser_preview.add_argument("--input-dir", default=".", help="Directory containing source files.")
-    parser_preview.add_argument("--pattern", default="*.xls", help="Glob pattern for source files.")
+    parser_preview.add_argument(
+        "--pattern",
+        default=",".join(DEFAULT_FILE_PATTERNS),
+        help="Glob pattern(s) for source files. Comma-separated values are supported.",
+    )
     parser_preview.add_argument("--uploaded-at", help="Override upload timestamp for worksheet names.")
     parser_preview.add_argument("--max-rows-per-batch", type=int, default=1000, help="Rows per Google Sheets update call.")
 
@@ -82,7 +102,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser_upload.add_argument("--credentials", required=True, help="Path to service account JSON file.")
     parser_upload.add_argument("--spreadsheet-id", required=True, help="Target Google Spreadsheet ID.")
     parser_upload.add_argument("--input-dir", default=".", help="Directory containing source files.")
-    parser_upload.add_argument("--pattern", default="*.xls", help="Glob pattern for source files.")
+    parser_upload.add_argument(
+        "--pattern",
+        default=",".join(DEFAULT_FILE_PATTERNS),
+        help="Glob pattern(s) for source files. Comma-separated values are supported.",
+    )
     parser_upload.add_argument("--uploaded-at", help="Override upload timestamp for worksheet names.")
     parser_upload.add_argument("--max-rows-per-batch", type=int, default=1000, help="Rows per Google Sheets update call.")
 

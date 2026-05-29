@@ -47,6 +47,7 @@ summary_cards_component = components.declare_component(
 )
 
 SHOW_PERF_LOG_PANEL = False
+CACHE_SCHEMA_VERSION = "2026-05-29-ny4526-fix"
 
 GOOGLE_CREDENTIALS_FILE = Path(__file__).parent / "streamlit-sheets-upload-34b193fd0a59.json"
 GOOGLE_SPREADSHEET_ID = "1Jy1DFHveJYFEw2lVg_pUGeE7HCcFmYaeUb6FwSrZGJM"
@@ -1233,7 +1234,7 @@ def compute_inventory_d5_metrics(df: pd.DataFrame) -> tuple[pd.Series, pd.Series
 
 
 @st.cache_resource(ttl=1800, show_spinner="스프레드시트 데이터를 불러오는 중입니다...")
-def load_dashboard_base_data():
+def load_dashboard_base_data(cache_version: str = CACHE_SCHEMA_VERSION):
     perf_rows: list[dict] = []
     step_start = perf_counter()
     spreadsheet = open_spreadsheet()
@@ -1474,20 +1475,14 @@ def load_dashboard_base_data():
 
     # Address first: create candidate groups by normalized site, then split them
     # by project-name similarity so unrelated jobs at the same site stay separate.
-    # If address is missing, fall back to a project-key bucket so same project rows
-    # (e.g. 2층/3층 split orders) can still be grouped together.
+    # If address is missing, keep grouping conservative by using order number bucket.
     merged["_cluster_base_address"] = merged["기본주소"].astype(str)
     missing_addr_mask = (~merged["_cluster_base_address"].astype(str).str.strip().astype(bool)) | (
         merged["_cluster_base_address"] == "주소 미등록"
     )
-    missing_project_bucket = (
-        merged["_cluster_project_key"]
-        .replace("", pd.NA)
-        .fillna(merged["프로젝트키"].replace("", pd.NA))
-        .fillna(merged["수주번호_norm"])
-        .astype(str)
-    )
-    merged.loc[missing_addr_mask, "_cluster_base_address"] = "주소미등록::" + missing_project_bucket[missing_addr_mask]
+    merged.loc[missing_addr_mask, "_cluster_base_address"] = "주소미등록::" + merged["수주번호_norm"].astype(str)[
+        missing_addr_mask
+    ]
 
     for base_address, addr_group in merged.groupby("_cluster_base_address", dropna=False):
         if not base_address:
@@ -1585,86 +1580,57 @@ def load_dashboard_base_data():
                 cluster["name_tokens"] = set(cluster.get("name_tokens", set())) | set(info["name_tokens"])
                 cluster["display_tokens"] = set(cluster.get("display_tokens", set())) | set(info["display_tokens"])
 
-        # Large unresolved groups are expensive with pairwise-like matching.
-        # Use a fast token-signature clustering path for bulk cases.
-        if len(still_unresolved_rows) > 250:
-            token_signature_clusters: dict[str, dict] = {}
-            for info in still_unresolved_rows:
-                tokens_sorted = sorted(info["tokens"])
-                if tokens_sorted:
-                    signature = "|".join(tokens_sorted[:2])
-                else:
-                    # Keep truly tokenless rows separate to avoid false merges.
-                    signature = f"__solo__{info['idx']}"
-                cluster = token_signature_clusters.get(signature)
-                if cluster is None:
-                    cluster = {
-                        "indices": [info["idx"]],
-                        "name": info["name"],
-                        "display": info["display"],
-                        "name_tokens": set(info["name_tokens"]),
-                        "display_tokens": set(info["display_tokens"]),
-                        "tokens": set(info["tokens"]),
-                    }
-                    clusters.append(cluster)
-                    token_signature_clusters[signature] = cluster
-                else:
-                    cluster["indices"].append(info["idx"])
-                    cluster["tokens"] = set(cluster.get("tokens", set())) | info["tokens"]
-                    cluster["name_tokens"] = set(cluster.get("name_tokens", set())) | set(info["name_tokens"])
-                    cluster["display_tokens"] = set(cluster.get("display_tokens", set())) | set(info["display_tokens"])
-        else:
-            token_to_cluster_indices: dict[str, set[int]] = {}
-            for cluster_idx, cluster in enumerate(clusters):
-                for token in cluster.get("tokens", set()):
-                    token_to_cluster_indices.setdefault(token, set()).add(cluster_idx)
+        token_to_cluster_indices: dict[str, set[int]] = {}
+        for cluster_idx, cluster in enumerate(clusters):
+            for token in cluster.get("tokens", set()):
+                token_to_cluster_indices.setdefault(token, set()).add(cluster_idx)
 
-            for info in still_unresolved_rows:
-                matched_cluster = None
-                matched_cluster_idx = -1
-                best_score = 0.0
-                candidate_cluster_indices: set[int] = set()
-                for token in info["tokens"]:
-                    candidate_cluster_indices.update(token_to_cluster_indices.get(token, set()))
+        for info in still_unresolved_rows:
+            matched_cluster = None
+            matched_cluster_idx = -1
+            best_score = 0.0
+            candidate_cluster_indices: set[int] = set()
+            for token in info["tokens"]:
+                candidate_cluster_indices.update(token_to_cluster_indices.get(token, set()))
 
-                for cluster_idx in candidate_cluster_indices:
-                    cluster = clusters[cluster_idx]
-                    score = max(
-                        token_jaccard(info["name_tokens"], cluster.get("name_tokens", set())),
-                        token_jaccard(info["display_tokens"], cluster.get("display_tokens", set())),
-                    )
-                    if score > best_score:
-                        best_score = score
-                        matched_cluster = cluster
-                        matched_cluster_idx = cluster_idx
+            for cluster_idx in candidate_cluster_indices:
+                cluster = clusters[cluster_idx]
+                score = max(
+                    token_jaccard(info["name_tokens"], cluster.get("name_tokens", set())),
+                    token_jaccard(info["display_tokens"], cluster.get("display_tokens", set())),
+                )
+                if score > best_score:
+                    best_score = score
+                    matched_cluster = cluster
+                    matched_cluster_idx = cluster_idx
 
-                if matched_cluster and best_score >= 0.35:
-                    prev_tokens = set(matched_cluster.get("tokens", set()))
-                    matched_cluster["indices"].append(info["idx"])
-                    merged_tokens = prev_tokens | set(info["tokens"])
-                    matched_cluster["tokens"] = merged_tokens
-                    matched_cluster["name_tokens"] = set(matched_cluster.get("name_tokens", set())) | set(info["name_tokens"])
-                    matched_cluster["display_tokens"] = set(matched_cluster.get("display_tokens", set())) | set(
-                        info["display_tokens"]
-                    )
-                    if len(info["display"]) < len(matched_cluster["display"]) and info["display"]:
-                        matched_cluster["display"] = info["display"]
-                    for token in (merged_tokens - prev_tokens):
-                        token_to_cluster_indices.setdefault(token, set()).add(matched_cluster_idx)
-                    continue
+            if matched_cluster and best_score >= 0.35:
+                prev_tokens = set(matched_cluster.get("tokens", set()))
+                matched_cluster["indices"].append(info["idx"])
+                merged_tokens = prev_tokens | set(info["tokens"])
+                matched_cluster["tokens"] = merged_tokens
+                matched_cluster["name_tokens"] = set(matched_cluster.get("name_tokens", set())) | set(info["name_tokens"])
+                matched_cluster["display_tokens"] = set(matched_cluster.get("display_tokens", set())) | set(
+                    info["display_tokens"]
+                )
+                if len(info["display"]) < len(matched_cluster["display"]) and info["display"]:
+                    matched_cluster["display"] = info["display"]
+                for token in (merged_tokens - prev_tokens):
+                    token_to_cluster_indices.setdefault(token, set()).add(matched_cluster_idx)
+                continue
 
-                new_cluster = {
-                    "indices": [info["idx"]],
-                    "name": info["name"],
-                    "display": info["display"],
-                    "name_tokens": set(info["name_tokens"]),
-                    "display_tokens": set(info["display_tokens"]),
-                    "tokens": set(info["tokens"]),
-                }
-                clusters.append(new_cluster)
-                new_cluster_idx = len(clusters) - 1
-                for token in new_cluster["tokens"]:
-                    token_to_cluster_indices.setdefault(token, set()).add(new_cluster_idx)
+            new_cluster = {
+                "indices": [info["idx"]],
+                "name": info["name"],
+                "display": info["display"],
+                "name_tokens": set(info["name_tokens"]),
+                "display_tokens": set(info["display_tokens"]),
+                "tokens": set(info["tokens"]),
+            }
+            clusters.append(new_cluster)
+            new_cluster_idx = len(clusters) - 1
+            for token in new_cluster["tokens"]:
+                token_to_cluster_indices.setdefault(token, set()).add(new_cluster_idx)
 
         assign_idx: list[int] = []
         assign_vals: list[str] = []
@@ -1691,10 +1657,11 @@ def load_dashboard_data(
     etc_amount_threshold: int = 100_000_000,
     product_family: str = "\ucda9\uc8fc",
     export_only_nonstock_custom: bool = True,
+    cache_version: str = CACHE_SCHEMA_VERSION,
 ):
     perf_rows: list[dict] = []
     step_start = perf_counter()
-    base_data = load_dashboard_base_data()
+    base_data = load_dashboard_base_data(cache_version=cache_version)
     step_start = record_perf_step(perf_rows, "base_data_fetch", step_start)
     latest_titles = base_data["source_titles"]
     na_keyword_rows = base_data["north_america_keyword_rows"]

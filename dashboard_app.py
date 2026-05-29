@@ -560,7 +560,7 @@ def normalize_address(value) -> str:
     text = re.sub(r"(지하\s*\d+층|지상\s*\d+층|\d+\s*층|\d+\s*F|\d+F)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"(\d+\s*호|\d+\s*실|[A-Z]동\s*\d+호|[A-Z]동|\d+동)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"(회의실|사무실|창고|현장|센터|로비|데스크)\s*$", "", text)
-    text = re.sub(r"[,\-]+$", "", text).strip()
+    text = re.sub(r"[,\-\.]+$", "", text).strip()
     text = re.sub(r"\s{2,}", " ", text)
     return text
 
@@ -569,6 +569,8 @@ def simplify_project_name(value) -> str:
     text = str(value or "").strip()
     if not text or text.lower() == "nan":
         return ""
+    # Floor-only suffixes should not split one project into separate groups.
+    text = re.sub(r"\b(B?\d+\s*F|B\d+\s*층|\d+\s*층)\b", "", text, flags=re.IGNORECASE)
     text = re.sub(r"\([^)]*(주문품|추가|변경|납품|설치|시공|별도)[^)]*\)", "", text)
     text = re.sub(r"\b(주문품|추가|변경|납품|설치|시공|케비넷|캐비넷|책상|의자|가구|스크린|퍼티션|데스크)\b.*$", "", text)
     text = re.sub(r"[-_/|]+.*$", "", text)
@@ -751,6 +753,7 @@ def extract_name_tokens(value: str) -> frozenset[str]:
     text = build_display_name(value, "")
     if not text:
         return frozenset()
+    text = re.sub(r"\b(B?\d+\s*F|B\d+\s*층|\d+\s*층)\b", " ", text, flags=re.IGNORECASE)
     raw_tokens = re.split(r"[\s\-_()/]+", text)
     stopwords = {
         "주",
@@ -1471,8 +1474,23 @@ def load_dashboard_base_data():
 
     # Address first: create candidate groups by normalized site, then split them
     # by project-name similarity so unrelated jobs at the same site stay separate.
-    for base_address, addr_group in merged.groupby("기본주소", dropna=False):
-        if not base_address or base_address == "주소 미등록":
+    # If address is missing, fall back to a project-key bucket so same project rows
+    # (e.g. 2층/3층 split orders) can still be grouped together.
+    merged["_cluster_base_address"] = merged["기본주소"].astype(str)
+    missing_addr_mask = (~merged["_cluster_base_address"].astype(str).str.strip().astype(bool)) | (
+        merged["_cluster_base_address"] == "주소 미등록"
+    )
+    missing_project_bucket = (
+        merged["_cluster_project_key"]
+        .replace("", pd.NA)
+        .fillna(merged["프로젝트키"].replace("", pd.NA))
+        .fillna(merged["수주번호_norm"])
+        .astype(str)
+    )
+    merged.loc[missing_addr_mask, "_cluster_base_address"] = "주소미등록::" + missing_project_bucket[missing_addr_mask]
+
+    for base_address, addr_group in merged.groupby("_cluster_base_address", dropna=False):
+        if not base_address:
             merged.loc[addr_group.index, "통합수주건키"] = addr_group["수주번호_norm"]
             continue
         if len(addr_group) == 1:
